@@ -1,6 +1,0 @@
-flask
-line-bot-sdk==2.4.2
-requests==2.28.2
-apscheduler
-pytz
-gunicorn
