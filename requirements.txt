@@ -1,0 +1,6 @@
+flask
+linebot
+requests
+apscheduler
+pytz
+gunicorn
