@@ -1,6 +1,7 @@
 flask
-linebot
+linebot==3.5.0
 requests
 apscheduler
 pytz
 gunicorn
+aiohttp==3.9.5
