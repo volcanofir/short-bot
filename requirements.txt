@@ -3,4 +3,3 @@ requests
 apscheduler
 pytz
 gunicorn
-yfinance
