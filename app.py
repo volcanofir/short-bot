@@ -6,7 +6,7 @@ import base64
 import requests
 from flask import Flask, request, abort
 from apscheduler.schedulers.background import BackgroundScheduler
-from datetime import datetime, timedelta
+from datetime import datetime
 import pytz
 import logging
 
@@ -21,8 +21,37 @@ USER_ID = os.environ.get("LINE_USER_ID", "")
 TW_TZ = pytz.timezone("Asia/Taipei")
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
-# 股票名稱快取
-_name_cache = {}
+# ──────────────────────────────────────────────
+# 台股監控清單（成交量大、當沖率高的熱門股）
+# 涵蓋上市上櫃共約 300 支
+# ──────────────────────────────────────────────
+WATCH_LIST_TW = [
+    # 半導體/電子
+    "2330","2303","2317","2454","2382","3711","2308","2379","2301","2344",
+    "2337","2360","3034","3036","2388","2376","6669","2347","2357","2395",
+    "3008","3045","2449","2408","2353","2385","2323","2340","3041","2393",
+    "2351","2369","6533","3529","6271","3231","2368","2409","6147","2363",
+    # 金融
+    "2882","2881","2886","2884","2891","2883","2880","2885","2887","2892",
+    "2890","2889","2888","5880","2823","2836",
+    # 傳產/其他大型
+    "1301","1303","1326","2002","1402","2207","2201","1216","2912","9904",
+    "1101","1102","2105","2603","2609","2615","2618","2610",
+    # 中小型熱門/當沖
+    "3023","6679","6477","3037","6446","5274","3705","4966","6515","3714",
+    "8069","6770","6472","3596","6488","4919","3545","6510","3086","6531",
+    "6278","5347","3035","6257","2421","4736","3443","4958","6670","6548",
+    "3047","6EL8","6491","3661","3714","6257","4763","5269","3189","2399",
+    "6116","6488","3374","2433","3680","6227","6592","4977","3653","6533",
+    "8046","6415","3016","2429","6285","3694","2441","6456","6456","3311",
+    "2913","3702","6239","2492","3013","4904","2474","6443","3533","6409",
+    # 上櫃熱門
+    "6789","6269","3622","6265","3583","4961","6191","6116","8112","6756",
+    "6278","3680","6488","4977","3714","6257","6515","6770","3545","6679",
+]
+
+# 去重
+WATCH_LIST_TW = list(dict.fromkeys(WATCH_LIST_TW))
 
 
 def get_headers():
@@ -62,171 +91,97 @@ def verify_signature(body, sig):
 
 
 # ──────────────────────────────────────────────
-# 股票名稱查詢
+# Yahoo Finance 批次報價 API
 # ──────────────────────────────────────────────
 
-def get_stock_name(code):
-    """從 FinMind 查股票名稱（快取避免重複查）"""
-    if code in _name_cache:
-        return _name_cache[code]
-    try:
-        r = requests.get(
-            "https://api.finmindtrade.com/api/v4/data",
-            params={"dataset": "TaiwanStockInfo", "stock_id": code},
-            timeout=8, headers={"User-Agent": UA}
-        )
-        data = r.json().get("data", [])
-        if data:
-            name = data[0].get("stock_name", code)
-            _name_cache[code] = name
-            return name
-    except Exception:
-        pass
-    _name_cache[code] = code
-    return code
-
-
-# ──────────────────────────────────────────────
-# 資料抓取
-# ──────────────────────────────────────────────
-
-def fetch_finmind_today():
-    """FinMind 當日股價（收盤後可用）"""
-    today = datetime.now(TW_TZ).strftime("%Y-%m-%d")
-    results = []
-    try:
-        r = requests.get(
-            "https://api.finmindtrade.com/api/v4/data",
-            params={"dataset": "TaiwanStockPrice", "start_date": today},
-            timeout=20, headers={"User-Agent": UA}
-        )
-        rows = r.json().get("data", [])
-        logger.info(f"FinMind today rows: {len(rows)}")
-
-        for row in rows:
-            try:
-                code = str(row.get("stock_id", "")).strip()
-                if not code.isdigit() or len(code) != 4:
-                    continue
-                close = float(row.get("close", 0))
-                spread = float(row.get("spread", 0))
-                vol = int(float(str(row.get("Trading_Volume", 0)).replace(",", ""))) // 1000
-                prev = close - spread
-                if prev <= 0 or close <= 0 or vol <= 0:
-                    continue
-                pct = spread / prev * 100
-                if 3.0 <= pct <= 9.5 and vol >= 500:
-                    results.append({
-                        "market": "台股", "code": code, "name": code,
-                        "close": round(close, 2), "pct": round(pct, 2), "vol": vol,
-                        "signal": get_signal(pct, vol)
-                    })
-            except Exception:
-                continue
-    except Exception as e:
-        logger.error(f"FinMind today error: {e}")
-
-    # 批次查名稱（最多查前 15 支）
-    for item in results[:15]:
-        item["name"] = get_stock_name(item["code"])
-
-    return results
-
-
-def fetch_yahoo_tw():
-    """Yahoo Finance 台灣股票漲幅排行"""
+def fetch_yahoo_quotes(symbols):
+    """
+    用 Yahoo Finance v7 quote API 批次查詢
+    這個 endpoint 不受地區限制，海外 IP 完全可用
+    """
     results = []
     headers = {
         "User-Agent": UA,
         "Accept": "application/json",
-        "Content-Type": "application/json"
+        "Referer": "https://finance.yahoo.com"
     }
 
-    # 方法1：Yahoo screener POST
-    try:
-        url = "https://query1.finance.yahoo.com/v1/finance/screener"
-        params = {"formatted": "false", "lang": "en-US", "region": "TW"}
-        payload = {
-            "offset": 0, "size": 200,
-            "sortField": "percentchange", "sortType": "DESC",
-            "quoteType": "EQUITY", "topOperator": "AND",
-            "query": {
-                "operator": "AND",
-                "operands": [
-                    {"operator": "EQ", "operands": ["region", "tw"]},
-                    {"operator": "GT", "operands": ["percentchange", 2.9]},
-                    {"operator": "LT", "operands": ["percentchange", 9.6]}
-                ]
-            }
-        }
-        r = requests.post(url, params=params, json=payload, headers=headers, timeout=20)
-        resp = r.json()
-        result_list = resp.get("finance", {}).get("result", None) or []
-        quotes = result_list[0].get("quotes", []) if result_list else []
-        logger.info(f"Yahoo screener quotes: {len(quotes)}")
+    # 每次最多查 50 支，分批處理
+    batch_size = 50
+    for i in range(0, len(symbols), batch_size):
+        batch = symbols[i:i+batch_size]
+        # 加上 .TW 後綴
+        tickers = ",".join([f"{s}.TW" for s in batch])
+        url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={tickers}&fields=regularMarketPrice,regularMarketChangePercent,regularMarketVolume,shortName,regularMarketChange,regularMarketPreviousClose"
 
-        for q in quotes:
-            try:
-                symbol = str(q.get("symbol", ""))
-                code = symbol.replace(".TW", "").replace(".TWO", "")
-                if not code.isdigit() or len(code) != 4:
-                    continue
-                name = q.get("shortName", "") or q.get("longName", "") or code
-                close = float(q.get("regularMarketPrice", 0))
-                pct = float(q.get("regularMarketChangePercent", 0))
-                vol = int(q.get("regularMarketVolume", 0)) // 1000
-                market = "上市" if symbol.endswith(".TW") else "上櫃"
-                if close <= 0 or vol <= 0:
-                    continue
-                if 3.0 <= pct <= 9.5 and vol >= 500:
-                    results.append({
-                        "market": market, "code": code, "name": name,
-                        "close": round(close, 2), "pct": round(pct, 2), "vol": vol,
-                        "signal": get_signal(pct, vol)
-                    })
-            except Exception:
-                continue
-        if results:
-            return results
-    except Exception as e:
-        logger.error(f"Yahoo screener error: {e}")
+        try:
+            r = requests.get(url, headers=headers, timeout=15)
+            data = r.json()
+            quotes = data.get("quoteResponse", {}).get("result", [])
 
-    # 方法2：Yahoo v8 chart 抓大盤成分股清單
-    try:
-        url2 = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
-        params2 = {
-            "count": 100, "scrIds": "day_gainers",
-            "formatted": "false", "region": "TW", "lang": "zh-TW"
-        }
-        r2 = requests.get(url2, params=params2, headers=headers, timeout=15)
-        resp2 = r2.json()
-        result_list2 = resp2.get("finance", {}).get("result", None) or []
-        quotes2 = result_list2[0].get("quotes", []) if result_list2 else []
-        logger.info(f"Yahoo predefined: {len(quotes2)}")
+            for q in quotes:
+                try:
+                    symbol = q.get("symbol", "")
+                    code = symbol.replace(".TW", "").replace(".TWO", "")
+                    name = q.get("shortName", "") or code
+                    close = float(q.get("regularMarketPrice", 0))
+                    pct = float(q.get("regularMarketChangePercent", 0))
+                    vol = int(q.get("regularMarketVolume", 0)) // 1000
 
-        for q in quotes2:
-            try:
-                symbol = str(q.get("symbol", ""))
-                if ".TW" not in symbol:
+                    if close <= 0 or vol <= 0:
+                        continue
+                    if 3.0 <= pct <= 9.5 and vol >= 500:
+                        market = "上市" if symbol.endswith(".TW") else "上櫃"
+                        results.append({
+                            "market": market,
+                            "code": code,
+                            "name": name,
+                            "close": round(close, 2),
+                            "pct": round(pct, 2),
+                            "vol": vol,
+                            "signal": get_signal(pct, vol)
+                        })
+                except Exception:
                     continue
-                code = symbol.replace(".TW", "").replace(".TWO", "")
-                if not code.isdigit() or len(code) != 4:
+        except Exception as e:
+            logger.error(f"Yahoo quote batch error: {e}")
+
+    # 也查一批上櫃（.TWO）
+    for i in range(0, min(len(symbols), 100), batch_size):
+        batch = symbols[i:i+batch_size]
+        tickers = ",".join([f"{s}.TWO" for s in batch])
+        url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={tickers}&fields=regularMarketPrice,regularMarketChangePercent,regularMarketVolume,shortName"
+
+        try:
+            r = requests.get(url, headers=headers, timeout=15)
+            data = r.json()
+            quotes = data.get("quoteResponse", {}).get("result", [])
+            for q in quotes:
+                try:
+                    symbol = q.get("symbol", "")
+                    if not symbol:
+                        continue
+                    code = symbol.replace(".TWO", "").replace(".TW", "")
+                    name = q.get("shortName", "") or code
+                    close = float(q.get("regularMarketPrice", 0))
+                    pct = float(q.get("regularMarketChangePercent", 0))
+                    vol = int(q.get("regularMarketVolume", 0)) // 1000
+                    if close <= 0 or vol <= 0:
+                        continue
+                    if 3.0 <= pct <= 9.5 and vol >= 500:
+                        results.append({
+                            "market": "上櫃",
+                            "code": code,
+                            "name": name,
+                            "close": round(close, 2),
+                            "pct": round(pct, 2),
+                            "vol": vol,
+                            "signal": get_signal(pct, vol)
+                        })
+                except Exception:
                     continue
-                name = q.get("shortName", code)
-                close = float(q.get("regularMarketPrice", 0))
-                pct = float(q.get("regularMarketChangePercent", 0))
-                vol = int(q.get("regularMarketVolume", 0)) // 1000
-                market = "上市" if symbol.endswith(".TW") else "上櫃"
-                if 3.0 <= pct <= 9.5 and vol >= 500:
-                    results.append({
-                        "market": market, "code": code, "name": name,
-                        "close": round(close, 2), "pct": round(pct, 2), "vol": vol,
-                        "signal": get_signal(pct, vol)
-                    })
-            except Exception:
-                continue
-    except Exception as e:
-        logger.error(f"Yahoo predefined error: {e}")
+        except Exception as e:
+            logger.error(f"Yahoo TWO batch error: {e}")
 
     return results
 
@@ -241,21 +196,17 @@ def get_signal(pct, vol):
 
 
 def screen():
-    # 收盤後優先用 FinMind（資料完整）
-    now = datetime.now(TW_TZ)
-    if now.hour >= 14:  # 收盤後
-        candidates = fetch_finmind_today()
-        if candidates:
-            candidates.sort(key=lambda x: x["vol"], reverse=True)
-            return candidates[:10]
-
-    # 盤中或 FinMind 無資料 → 用 Yahoo
-    candidates = fetch_yahoo_tw()
-    if not candidates:
-        candidates = fetch_finmind_today()
-
-    candidates.sort(key=lambda x: x["vol"], reverse=True)
-    return candidates[:10]
+    candidates = fetch_yahoo_quotes(WATCH_LIST_TW)
+    # 去重（同代號可能上市上櫃都查到）
+    seen = set()
+    unique = []
+    for c in candidates:
+        if c["code"] not in seen:
+            seen.add(c["code"])
+            unique.append(c)
+    unique.sort(key=lambda x: x["vol"], reverse=True)
+    logger.info(f"Screen results: {len(unique)}")
+    return unique[:10]
 
 
 # ──────────────────────────────────────────────
@@ -319,58 +270,30 @@ def build_test_message():
     now = datetime.now(TW_TZ).strftime("%m/%d %H:%M")
     lines = [f"🔧 系統測試 {now}\n"]
 
-    # FinMind 今日
+    # 測試 Yahoo v7 quote API
     try:
-        today = datetime.now(TW_TZ).strftime("%Y-%m-%d")
-        r = requests.get(
-            "https://api.finmindtrade.com/api/v4/data",
-            params={"dataset": "TaiwanStockPrice", "start_date": today},
-            timeout=12, headers={"User-Agent": UA}
-        )
-        rows = r.json().get("data", [])
-        lines.append(f"{'✅' if rows else '⚠️'} FinMind 今日（{len(rows)} 筆）")
-        if not rows:
-            lines.append("   → 可能資料尚未更新（收盤後約30分鐘）")
-    except Exception as e:
-        lines.append(f"❌ FinMind 失敗：{str(e)[:40]}")
-
-    # Yahoo screener
-    try:
-        url = "https://query1.finance.yahoo.com/v1/finance/screener"
-        payload = {
-            "offset": 0, "size": 5,
-            "sortField": "percentchange", "sortType": "DESC",
-            "quoteType": "EQUITY", "topOperator": "AND",
-            "query": {
-                "operator": "AND",
-                "operands": [
-                    {"operator": "EQ", "operands": ["region", "tw"]},
-                    {"operator": "GT", "operands": ["percentchange", 1]}
-                ]
-            }
-        }
-        r = requests.post(url, params={"formatted": "false", "lang": "en-US", "region": "TW"},
-                          json=payload, timeout=12,
-                          headers={"User-Agent": UA, "Content-Type": "application/json"})
-        resp = r.json()
-        result_list = resp.get("finance", {}).get("result", None) or []
-        quotes = result_list[0].get("quotes", []) if result_list else []
-        lines.append(f"{'✅' if quotes else '⚠️'} Yahoo Screener（{len(quotes)} 筆）")
+        test_symbols = "2330.TW,2317.TW,2454.TW"
+        url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={test_symbols}"
+        r = requests.get(url, headers={"User-Agent": UA}, timeout=10)
+        quotes = r.json().get("quoteResponse", {}).get("result", [])
+        lines.append(f"✅ Yahoo v7 Quote API 正常（{len(quotes)} 筆）")
         if quotes:
             q = quotes[0]
-            lines.append(f"   範例：{q.get('symbol')} +{round(q.get('regularMarketChangePercent',0),1)}%")
+            pct = round(q.get("regularMarketChangePercent", 0), 2)
+            price = q.get("regularMarketPrice", 0)
+            lines.append(f"   {q.get('symbol')}: {price} ({pct:+.2f}%)")
     except Exception as e:
-        lines.append(f"❌ Yahoo 失敗：{str(e)[:40]}")
+        lines.append(f"❌ Yahoo v7 失敗：{str(e)[:50]}")
 
-    # 篩選結果
+    # 跑一次篩選
     candidates = screen()
     lines.append(f"\n📊 篩選結果：{len(candidates)} 支")
     if candidates:
-        t = candidates[0]
-        lines.append(f"最大量：{t['code']} {t['name']}")
-        lines.append(f"+{t['pct']}% | {t['vol']:,} 張 | {t['signal']}")
+        for c in candidates[:3]:
+            lines.append(f"• {c['code']} {c['name']} +{c['pct']}% {c['vol']:,}張 {c['signal']}")
     else:
         lines.append("（目前無符合條件標的）")
+        lines.append("\n監控清單共 " + str(len(WATCH_LIST_TW)) + " 支")
 
     return [{"type": "text", "text": "\n".join(lines)}]
 
@@ -415,7 +338,7 @@ def callback():
         uid = event["source"]["userId"]
 
         if text in ["掃描", "篩選", "今天", "標的", "做空"]:
-            reply(rt, [{"type": "text", "text": "⏳ 篩選中，請稍候 10~20 秒..."}])
+            reply(rt, [{"type": "text", "text": "⏳ 篩選中，請稍候 15~30 秒..."}])
             push(uid, build_messages(screen()))
         elif text == "測試":
             reply(rt, [{"type": "text", "text": "🔧 測試中，請稍候..."}])
@@ -426,7 +349,8 @@ def callback():
                 "【篩選標的】掃描 / 篩選 / 今天 / 標的 / 做空\n"
                 "【系統測試】測試\n"
                 "【自動推播】每日 15:35\n\n"
-                "篩選條件：漲幅 3~9.5% + 量能足夠"
+                "篩選條件：漲幅 3~9.5% + 量能足夠\n"
+                f"監控清單：{len(WATCH_LIST_TW)} 支熱門股"
             )}])
         else:
             reply(rt, [{"type": "text", "text": "傳「掃描」篩選標的，傳「測試」檢查系統，傳「說明」查看指令。"}])
