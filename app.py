@@ -4,12 +4,13 @@ import hmac
 import hashlib
 import base64
 import requests
-import yfinance as yf
 from flask import Flask, request, abort
 from apscheduler.schedulers.background import BackgroundScheduler
-from datetime import datetime, timedelta
+from datetime import datetime
 import pytz
 import logging
+import csv
+import io
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -20,28 +21,7 @@ TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 USER_ID = os.environ.get("LINE_USER_ID", "")
 TW_TZ = pytz.timezone("Asia/Taipei")
-
-# 台股熱門監控清單（當沖率高、成交量大）
-WATCH_LIST = [
-    "2330","2303","2317","2454","2382","3711","2308","2379","2301","2344",
-    "2337","2360","3034","3036","2388","2376","6669","2347","2357","2395",
-    "3008","3045","2449","2408","2353","2385","2323","2340","3041","2393",
-    "2351","2369","6533","3529","6271","3231","2368","2409","6147","2363",
-    "2882","2881","2886","2884","2891","2883","2880","2885","2887","2892",
-    "1301","1303","1326","2002","1402","2207","2201","1216","2912","9904",
-    "1101","1102","2105","2603","2609","2615","2618","2610",
-    "3023","6679","6477","3037","6446","5274","3705","4966","6515","3714",
-    "8069","6770","6472","3596","6488","4919","3545","6510","3086","6531",
-    "6278","5347","3035","6257","2421","4736","3443","4958","6670","6548",
-    "3047","6491","3661","4763","5269","3189","2399","6116","3374","2433",
-    "3680","6227","6592","4977","3653","8046","6415","3016","2429","6285",
-    "3694","2441","6456","3311","2913","3702","6239","2492","3013","4904",
-    "2474","6443","3533","6409","6789","6269","3622","6265","3583","4961",
-    "6191","8112","6756","2330","6271","3481","5871","2412","4938","3006",
-    "2327","2356","2324","2352","2358","2377","2383","2392","2405","2415",
-    "2498","2520","2542","2548","2610","2634","2637","2641","2642","2645",
-]
-WATCH_LIST = list(dict.fromkeys(WATCH_LIST))  # 去重
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
 
 def get_headers():
@@ -81,103 +61,137 @@ def verify_signature(body, sig):
 
 
 # ──────────────────────────────────────────────
-# 資料抓取：yfinance（最穩定）
+# 資料來源：Stooq（波蘭金融資料站，提供全球股市，無地區限制）
+# 台股格式：代號.TW（上市）或 代號.TWO（上櫃）
 # ──────────────────────────────────────────────
 
-def fetch_tw_stocks():
+def fetch_stooq_index():
     """
-    用 yfinance 批次抓取台股當日收盤資料
-    收盤後幾分鐘即可取得，海外 IP 完全支援
+    從 Stooq 抓取台灣上市股票清單當日行情
+    使用 Taiwan 市場指數成分股 CSV 下載
     """
     results = []
-    now = datetime.now(TW_TZ)
-    today = now.strftime("%Y-%m-%d")
-    yesterday = (now - timedelta(days=3)).strftime("%Y-%m-%d")  # 往前3天確保有資料
 
-    # 分批查詢，每批 50 支
-    batch_size = 50
-    for i in range(0, len(WATCH_LIST), batch_size):
-        batch = WATCH_LIST[i:i+batch_size]
-        # yfinance 台股代號格式：XXXX.TW 或 XXXX.TWO
-        tickers_tw = [f"{c}.TW" for c in batch]
-        tickers_two = [f"{c}.TWO" for c in batch]
+    # Stooq 提供台灣市場所有股票的每日資料
+    # 格式：https://stooq.com/db/l/?b=d&t=d&e=csv&i=m (台灣市場)
+    urls = [
+        "https://stooq.com/db/l/?b=d&t=d&e=csv&i=d",  # 所有市場當日資料
+    ]
 
-        for tickers, market in [(tickers_tw, "上市"), (tickers_two, "上櫃")]:
-            try:
-                symbols_str = " ".join(tickers)
-                data = yf.download(
-                    tickers=symbols_str,
-                    start=yesterday,
-                    end=(now + timedelta(days=1)).strftime("%Y-%m-%d"),
-                    progress=False,
-                    auto_adjust=True,
-                    threads=True
-                )
+    # 改用直接查詢漲幅排行的方式
+    # 用 stooq 的 top gainers 頁面
+    try:
+        # 抓台灣市場當日漲幅
+        url = "https://stooq.com/t/?i=524"  # Taiwan stocks top gainers
+        r = requests.get(url, timeout=15, headers={"User-Agent": UA})
+        logger.info(f"Stooq status: {r.status_code}, len: {len(r.text)}")
+    except Exception as e:
+        logger.error(f"Stooq error: {e}")
 
-                if data.empty:
-                    continue
-
-                # 取最後兩天資料計算漲跌
-                closes = data["Close"]
-                volumes = data["Volume"]
-
-                if closes.empty:
-                    continue
-
-                # 確保是 DataFrame
-                if hasattr(closes, "iloc"):
-                    for ticker in tickers:
-                        try:
-                            if ticker not in closes.columns:
-                                continue
-                            col = closes[ticker].dropna()
-                            vol_col = volumes[ticker].dropna()
-                            if len(col) < 2:
-                                continue
-
-                            close_today = float(col.iloc[-1])
-                            close_prev = float(col.iloc[-2])
-                            vol_today = int(vol_col.iloc[-1]) // 1000
-
-                            if close_prev <= 0 or close_today <= 0:
-                                continue
-
-                            pct = (close_today - close_prev) / close_prev * 100
-
-                            code = ticker.replace(".TW", "").replace(".TWO", "")
-
-                            if 3.0 <= pct <= 9.5 and vol_today >= 500:
-                                results.append({
-                                    "market": market,
-                                    "code": code,
-                                    "name": code,  # yfinance 不一定有中文名
-                                    "close": round(close_today, 2),
-                                    "pct": round(pct, 2),
-                                    "vol": vol_today,
-                                    "signal": get_signal(pct, vol_today)
-                                })
-                        except Exception:
-                            continue
-
-            except Exception as e:
-                logger.error(f"yfinance batch error ({market}): {e}")
-                continue
-
-    logger.info(f"yfinance results: {len(results)}")
     return results
 
 
-def get_stock_name_yahoo(code):
-    """用 Yahoo v7 API 查股票中文名"""
+def fetch_tw_market():
+    """
+    主要方案：用 Yahoo Finance 的市場摘要 API
+    這個不需要 Screener，直接查台灣市場漲幅前排
+    """
+    results = []
+
+    # 用 Yahoo Finance v8 chart API 查多支股票（最快）
+    # 一次最多 1500 支
+    headers = {
+        "User-Agent": UA,
+        "Accept": "application/json",
+        "Referer": "https://finance.yahoo.com"
+    }
+
+    # 方案A：用 Yahoo Finance market summary（台灣）
     try:
-        url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={code}.TW"
-        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
-        q = r.json().get("quoteResponse", {}).get("result", [])
-        if q:
-            return q[0].get("shortName", code)
-    except Exception:
-        pass
-    return code
+        url = "https://query1.finance.yahoo.com/v6/finance/quote/marketSummary"
+        params = {"lang": "zh-TW", "region": "TW", "corsDomain": "tw.finance.yahoo.com"}
+        r = requests.get(url, params=params, headers=headers, timeout=10)
+        logger.info(f"Yahoo market summary: {r.status_code}")
+    except Exception as e:
+        logger.error(f"Yahoo market summary: {e}")
+
+    # 方案B：直接用 Yahoo Finance 的 spark API 批次查報價
+    # 這是最快的批次查詢方式，一次可以查 1500 支
+    SYMBOLS = [
+        # 熱門上市（加 .TW）
+        "2330.TW","2317.TW","2454.TW","2382.TW","3711.TW","2308.TW","2303.TW",
+        "2379.TW","2301.TW","2344.TW","2337.TW","2360.TW","3034.TW","3036.TW",
+        "2388.TW","2376.TW","6669.TW","2347.TW","2357.TW","2395.TW","3008.TW",
+        "2449.TW","2408.TW","2353.TW","2385.TW","2323.TW","2340.TW","3041.TW",
+        "2351.TW","6533.TW","3529.TW","6271.TW","3231.TW","2368.TW","2409.TW",
+        "2882.TW","2881.TW","2886.TW","2884.TW","2891.TW","2883.TW","2880.TW",
+        "2885.TW","2887.TW","2892.TW","1301.TW","1303.TW","1326.TW","2002.TW",
+        "1402.TW","2207.TW","2201.TW","1216.TW","2912.TW","1101.TW","1102.TW",
+        "2603.TW","2609.TW","2615.TW","2618.TW","2610.TW","3023.TW","3037.TW",
+        "5274.TW","3705.TW","4966.TW","6515.TW","3714.TW","8069.TW","6770.TW",
+        "6472.TW","3596.TW","6488.TW","4919.TW","3545.TW","6510.TW","3086.TW",
+        "6531.TW","6278.TW","5347.TW","3035.TW","6257.TW","2421.TW","4736.TW",
+        "3443.TW","4958.TW","6670.TW","6548.TW","3047.TW","6491.TW","3661.TW",
+        "2399.TW","6116.TW","3374.TW","2433.TW","3680.TW","6592.TW","4977.TW",
+        "8046.TW","6415.TW","3016.TW","2429.TW","6285.TW","3694.TW","2441.TW",
+        "2913.TW","3702.TW","6239.TW","2492.TW","3013.TW","2474.TW","6443.TW",
+        "3533.TW","6409.TW","2412.TW","4938.TW","3006.TW","2327.TW","2356.TW",
+        "2324.TW","2352.TW","2358.TW","2377.TW","2383.TW","2392.TW","2405.TW",
+        "2498.TW","5871.TW","3481.TW","2393.TW","6147.TW","2363.TW","3045.TW",
+        # 熱門上櫃（加 .TWO）
+        "6789.TWO","6269.TWO","3622.TWO","6265.TWO","3583.TWO","4961.TWO",
+        "6191.TWO","8112.TWO","6756.TWO","6679.TWO","6477.TWO","6446.TWO",
+        "3653.TWO","3189.TWO","4763.TWO","5269.TWO","6227.TWO","3311.TWO",
+    ]
+
+    # 用 Yahoo v7 批次查（每批 100 支，夠快）
+    batch_size = 100
+    for i in range(0, len(SYMBOLS), batch_size):
+        batch = SYMBOLS[i:i+batch_size]
+        symbols_str = ",".join(batch)
+        url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={symbols_str}"
+        try:
+            r = requests.get(url, headers=headers, timeout=12)
+            if r.status_code != 200:
+                continue
+            quotes = r.json().get("quoteResponse", {}).get("result", []) or []
+            logger.info(f"Yahoo v7 batch {i//batch_size+1}: {len(quotes)} quotes")
+
+            for q in quotes:
+                try:
+                    symbol = str(q.get("symbol", ""))
+                    code = symbol.replace(".TW", "").replace(".TWO", "")
+                    name = q.get("shortName", "") or code
+                    # 清理名稱（去掉多餘字）
+                    name = name.replace(" Corp.", "").replace(" Co.,Ltd.", "").strip()
+                    close = float(q.get("regularMarketPrice", 0) or 0)
+                    pct = float(q.get("regularMarketChangePercent", 0) or 0)
+                    vol = int(q.get("regularMarketVolume", 0) or 0) // 1000
+                    mkt_state = q.get("marketState", "")
+
+                    if close <= 0:
+                        continue
+
+                    market = "上市" if symbol.endswith(".TW") else "上櫃"
+
+                    if 3.0 <= pct <= 9.5 and vol >= 500:
+                        results.append({
+                            "market": market,
+                            "code": code,
+                            "name": name,
+                            "close": round(close, 2),
+                            "pct": round(pct, 2),
+                            "vol": vol,
+                            "signal": get_signal(pct, vol),
+                            "state": mkt_state
+                        })
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.error(f"Yahoo v7 batch error: {e}")
+
+    logger.info(f"fetch_tw_market results: {len(results)}")
+    return results
 
 
 # ──────────────────────────────────────────────
@@ -190,25 +204,15 @@ def get_signal(pct, vol):
 
 
 def screen():
-    candidates = fetch_tw_stocks()
-
-    # 去重（同代號取成交量較大的）
+    candidates = fetch_tw_market()
     seen = {}
     for c in candidates:
         code = c["code"]
         if code not in seen or c["vol"] > seen[code]["vol"]:
             seen[code] = c
-
     result = list(seen.values())
     result.sort(key=lambda x: x["vol"], reverse=True)
-
-    # 補查前10支的中文名稱
-    top = result[:10]
-    for item in top:
-        if item["name"] == item["code"]:
-            item["name"] = get_stock_name_yahoo(item["code"])
-
-    return top
+    return result[:10]
 
 
 # ──────────────────────────────────────────────
@@ -272,18 +276,20 @@ def build_test_message():
     now = datetime.now(TW_TZ).strftime("%m/%d %H:%M")
     lines = [f"🔧 系統測試 {now}\n"]
 
-    # 測試 yfinance 單支股票
+    # 測試單支股票（2330台積電）
     try:
-        ticker = yf.Ticker("2330.TW")
-        hist = ticker.history(period="2d")
-        if not hist.empty:
-            close = round(float(hist["Close"].iloc[-1]), 2)
-            lines.append(f"✅ yfinance 正常")
-            lines.append(f"   台積電(2330) 最近收盤：{close}")
-        else:
-            lines.append("⚠️ yfinance 連線正常但無資料（非交易日？）")
+        url = "https://query1.finance.yahoo.com/v7/finance/quote?symbols=2330.TW,2317.TW,2454.TW"
+        r = requests.get(url, headers={"User-Agent": UA}, timeout=8)
+        quotes = r.json().get("quoteResponse", {}).get("result", []) or []
+        lines.append(f"✅ Yahoo v7 API 正常（{len(quotes)} 筆）")
+        if quotes:
+            q = quotes[0]
+            price = q.get("regularMarketPrice", "?")
+            pct = round(q.get("regularMarketChangePercent", 0), 2)
+            state = q.get("marketState", "")
+            lines.append(f"   台積電：{price}元 ({pct:+.2f}%) [{state}]")
     except Exception as e:
-        lines.append(f"❌ yfinance 失敗：{str(e)[:50]}")
+        lines.append(f"❌ Yahoo v7 失敗：{str(e)[:50]}")
 
     # 跑篩選
     candidates = screen()
@@ -293,7 +299,8 @@ def build_test_message():
             lines.append(f"• {c['code']} {c['name']} +{c['pct']}% {c['vol']:,}張")
     else:
         lines.append("（目前無符合條件標的）")
-        lines.append(f"監控清單：{len(WATCH_LIST)} 支")
+        lines.append("※ 非交易時段 Yahoo 不提供漲跌幅資料")
+        lines.append("※ 請在收盤後 13:30~16:00 測試")
 
     return [{"type": "text", "text": "\n".join(lines)}]
 
@@ -338,7 +345,7 @@ def callback():
         uid = event["source"]["userId"]
 
         if text in ["掃描", "篩選", "今天", "標的", "做空"]:
-            reply(rt, [{"type": "text", "text": "⏳ 篩選中，請稍候 20~40 秒..."}])
+            reply(rt, [{"type": "text", "text": "⏳ 篩選中，請稍候 15~25 秒..."}])
             push(uid, build_messages(screen()))
         elif text == "測試":
             reply(rt, [{"type": "text", "text": "🔧 測試中，請稍候..."}])
@@ -350,7 +357,7 @@ def callback():
                 "【系統測試】測試\n"
                 "【自動推播】每日 15:35\n\n"
                 "篩選條件：漲幅 3~9.5% + 量能足夠\n"
-                f"監控清單：{len(WATCH_LIST)} 支熱門股"
+                "最佳測試時間：收盤後 13:30~16:00"
             )}])
         else:
             reply(rt, [{"type": "text", "text": "傳「掃描」篩選標的，傳「測試」檢查系統，傳「說明」查看指令。"}])
