@@ -20,6 +20,8 @@ SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 USER_ID = os.environ.get("LINE_USER_ID", "")
 TW_TZ = pytz.timezone("Asia/Taipei")
 
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+
 
 def get_headers():
     return {
@@ -58,96 +60,136 @@ def verify_signature(body, sig):
 
 
 # ──────────────────────────────────────────────
-# 資料抓取：證交所 openapi（每日更新）
+# 資料抓取
 # ──────────────────────────────────────────────
 
-def fetch_twse():
-    """上市股票 - 使用證交所 openapi"""
-    url = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
-    results = []
+def parse_change(s):
+    """解析漲跌價差，處理各種格式"""
+    s = str(s).replace(",", "").strip()
+    if not s or s in ["--", "nan", ""]:
+        return None
+    # 證交所用 X 表示負號
+    if s.startswith("X") or s.startswith("x"):
+        s = "-" + s[1:]
+    s = s.replace("+", "")
     try:
-        r = requests.get(url, timeout=20, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "application/json"
-        })
-        if r.status_code != 200:
-            logger.error(f"TWSE status: {r.status_code}")
-            return results
+        return float(s)
+    except Exception:
+        return None
+
+
+def fetch_twse():
+    """上市股票，嘗試多個來源"""
+    results = []
+
+    # 來源1：openapi（每日更新，有時早上還沒更新）
+    try:
+        r = requests.get(
+            "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
+            timeout=15, headers={"User-Agent": UA, "Accept": "application/json"}
+        )
         data = r.json()
-        logger.info(f"TWSE data count: {len(data)}")
-        if data:
-            logger.info(f"TWSE sample keys: {list(data[0].keys()) if data else 'empty'}")
+        if isinstance(data, list) and len(data) > 100:
+            logger.info(f"TWSE openapi: {len(data)} rows")
+            for item in data:
+                try:
+                    code = str(item.get("Code", "")).strip()
+                    name = str(item.get("Name", "")).strip()
+                    vol_str = str(item.get("TradeVolume", "0")).replace(",", "")
+                    close_str = str(item.get("ClosingPrice", "")).replace(",", "")
+                    chg = parse_change(item.get("Change", ""))
 
-        for item in data:
-            try:
-                code = str(item.get("Code", "") or item.get("股票代號", "")).strip()
-                name = str(item.get("Name", "") or item.get("股票名稱", "")).strip()
-                vol_str = str(item.get("TradeVolume", "") or item.get("成交股數", "0")).replace(",", "")
-                close_str = str(item.get("ClosingPrice", "") or item.get("收盤價", "0")).replace(",", "")
-                change_str = str(item.get("Change", "") or item.get("漲跌價差", "0")).replace(",", "").replace("+", "").strip()
-
-                if not code or not close_str or close_str in ["--", "", "0", "nan"]:
+                    if not close_str or close_str in ["--", "0", ""] or chg is None:
+                        continue
+                    close = float(close_str)
+                    vol = int(float(vol_str)) // 1000
+                    prev = close - chg
+                    if prev <= 0 or close <= 0:
+                        continue
+                    pct = chg / prev * 100
+                    if 3.0 <= pct <= 9.5 and vol >= 1000:
+                        results.append({
+                            "market": "上市", "code": code, "name": name,
+                            "close": round(close, 2), "pct": round(pct, 2), "vol": vol,
+                            "signal": get_signal(pct, vol)
+                        })
+                except Exception:
                     continue
-                if not change_str or change_str in ["--", "", "nan", "X0.00"]:
-                    continue
-
-                # 處理負號格式
-                if change_str.startswith("X"):
-                    change_str = "-" + change_str[1:]
-
-                vol = int(float(vol_str)) // 1000 if vol_str else 0
-                close = float(close_str)
-                chg = float(change_str)
-                prev = close - chg
-                if prev <= 0 or close <= 0:
-                    continue
-                pct = chg / prev * 100
-
-                if 3.0 <= pct <= 9.5 and vol >= 1000:
-                    results.append({
-                        "market": "上市", "code": code, "name": name,
-                        "close": round(close, 2), "pct": round(pct, 2), "vol": vol,
-                        "signal": get_signal(pct, vol)
-                    })
-            except Exception as ex:
-                continue
-
+            if results:
+                return results
     except Exception as e:
-        logger.error(f"TWSE fetch error: {e}")
+        logger.error(f"TWSE openapi failed: {e}")
+
+    # 來源2：證交所 rwd API（備用）
+    try:
+        today = datetime.now(TW_TZ).strftime("%Y%m%d")
+        r = requests.get(
+            f"https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?response=json&date={today}&type=ALLBUT0999",
+            timeout=15, headers={"User-Agent": UA}
+        )
+        data = r.json()
+        for table in data.get("tables", []):
+            fields = table.get("fields", [])
+            if "漲跌價差" in fields and "成交股數" in fields:
+                rows = table.get("data", [])
+                logger.info(f"TWSE rwd: {len(rows)} rows")
+                fi = {f: i for i, f in enumerate(fields)}
+                for row in rows:
+                    try:
+                        code = str(row[fi.get("證券代號", 0)]).strip()
+                        name = str(row[fi.get("證券名稱", 1)]).strip()
+                        vol = int(str(row[fi.get("成交股數", 2)]).replace(",", "")) // 1000
+                        close = float(str(row[fi.get("收盤價", -1)]).replace(",", ""))
+                        chg = parse_change(row[fi.get("漲跌價差", -1)])
+                        if chg is None:
+                            continue
+                        prev = close - chg
+                        if prev <= 0:
+                            continue
+                        pct = chg / prev * 100
+                        if 3.0 <= pct <= 9.5 and vol >= 1000:
+                            results.append({
+                                "market": "上市", "code": code, "name": name,
+                                "close": round(close, 2), "pct": round(pct, 2), "vol": vol,
+                                "signal": get_signal(pct, vol)
+                            })
+                    except Exception:
+                        continue
+                if results:
+                    return results
+    except Exception as e:
+        logger.error(f"TWSE rwd failed: {e}")
+
     return results
 
 
 def fetch_tpex():
-    """上櫃股票 - 使用櫃買中心 api"""
+    """上櫃股票"""
     today = datetime.now(TW_TZ)
     roc = f"{today.year-1911}/{today.month:02d}/{today.day:02d}"
-    url = f"https://www.tpex.org.tw/web/stock/aftertrading/otc_quotes_no1430/stk_wn1430_result.php?l=zh-tw&d={roc}&se=AL"
     results = []
     try:
-        r = requests.get(url, timeout=20, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        })
+        r = requests.get(
+            f"https://www.tpex.org.tw/web/stock/aftertrading/otc_quotes_no1430/stk_wn1430_result.php?l=zh-tw&d={roc}&se=AL",
+            timeout=15, headers={"User-Agent": UA}
+        )
         rows = r.json().get("aaData", [])
-        logger.info(f"TPEX data count: {len(rows)}")
+        logger.info(f"TPEX: {len(rows)} rows")
         for row in rows:
             try:
                 code = str(row[0]).strip()
                 name = str(row[1]).strip()
                 close_str = str(row[2]).replace(",", "")
-                change_str = str(row[3]).replace(",", "").replace("+", "").strip()
+                chg = parse_change(row[3])
                 vol_str = str(row[7]).replace(",", "")
-
-                if close_str in ["--", ""] or change_str in ["--", ""]:
+                if not close_str or close_str in ["--", ""] or chg is None:
                     continue
-
                 close = float(close_str)
-                chg = float(change_str)
-                vol = int(float(vol_str)) // 1000 if vol_str else 0
+                vol = int(float(vol_str)) // 1000
                 prev = close - chg
                 if prev <= 0:
                     continue
                 pct = chg / prev * 100
-
                 if 3.0 <= pct <= 9.5 and vol >= 500:
                     results.append({
                         "market": "上櫃", "code": code, "name": name,
@@ -162,7 +204,7 @@ def fetch_tpex():
 
 
 # ──────────────────────────────────────────────
-# 篩選邏輯
+# 篩選
 # ──────────────────────────────────────────────
 
 def get_signal(pct, vol):
@@ -174,13 +216,12 @@ def screen():
     twse = fetch_twse()
     tpex = fetch_tpex()
     candidates = twse + tpex
-    logger.info(f"Total candidates before sort: TWSE={len(twse)}, TPEX={len(tpex)}")
     candidates.sort(key=lambda x: x["vol"], reverse=True)
     return candidates[:10]
 
 
 # ──────────────────────────────────────────────
-# 訊息組裝
+# 訊息
 # ──────────────────────────────────────────────
 
 def build_messages(candidates):
@@ -189,15 +230,15 @@ def build_messages(candidates):
         return [{"type": "text", "text": (
             f"📊 {now} 收盤篩選完畢\n\n"
             "今日無符合條件的標的\n"
-            "（可能原因：今日量能普遍不足、或資料尚未更新）\n\n"
-            "傳「測試」可查看 API 連線狀態"
+            "（量能不足或漲幅不符合策略門檻）\n\n"
+            "傳「測試」可查看 API 狀態"
         )}]
 
     bubbles = []
     for c in candidates:
         color = "#ff3b3b" if "高度" in c["signal"] else "#ffb800" if "值得" in c["signal"] else "#888888"
         est_vol = max(1, int(c["vol"] * 0.02))
-        watch = f"• 明日試撮量低於 {est_vol:,} 張時注意\n• 漲不過 {round(c['close']*1.025, 1)} 元可考慮空\n• 停損設過早盤高點（控制 1% 內）"
+        watch = f"• 試撮量低於 {est_vol:,} 張時注意\n• 漲不過 {round(c['close']*1.025, 1)} 元可考慮空\n• 停損設過早盤高點（1% 內）"
         bubbles.append({
             "type": "bubble", "size": "kilo",
             "header": {
@@ -237,21 +278,33 @@ def build_messages(candidates):
 
 
 def build_test_message():
-    """測試 API 連線狀態"""
     now = datetime.now(TW_TZ).strftime("%m/%d %H:%M")
     lines = [f"🔧 系統測試 {now}\n"]
 
-    # 測試 TWSE
+    # 測試 openapi
     try:
         r = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
-                         timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+                         timeout=10, headers={"User-Agent": UA})
         data = r.json()
-        lines.append(f"✅ 上市 API 正常（{len(data)} 筆）")
-        if data:
-            sample = data[0]
-            lines.append(f"   欄位：{', '.join(list(sample.keys())[:4])}")
+        if isinstance(data, list) and len(data) > 0:
+            lines.append(f"✅ 上市 openapi 正常（{len(data)} 筆）")
+        else:
+            lines.append(f"⚠️ 上市 openapi 資料異常（{type(data)}）")
     except Exception as e:
-        lines.append(f"❌ 上市 API 失敗：{str(e)[:50]}")
+        lines.append(f"❌ 上市 openapi 失敗：{str(e)[:40]}")
+
+    # 測試 rwd
+    try:
+        today = datetime.now(TW_TZ).strftime("%Y%m%d")
+        r = requests.get(
+            f"https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?response=json&date={today}&type=ALLBUT0999",
+            timeout=10, headers={"User-Agent": UA}
+        )
+        data = r.json()
+        tables = data.get("tables", [])
+        lines.append(f"✅ 上市 rwd API 正常（{len(tables)} 個表）")
+    except Exception as e:
+        lines.append(f"❌ 上市 rwd 失敗：{str(e)[:40]}")
 
     # 測試 TPEX
     try:
@@ -259,36 +312,32 @@ def build_test_message():
         roc = f"{today.year-1911}/{today.month:02d}/{today.day:02d}"
         r = requests.get(
             f"https://www.tpex.org.tw/web/stock/aftertrading/otc_quotes_no1430/stk_wn1430_result.php?l=zh-tw&d={roc}&se=AL",
-            timeout=10, headers={"User-Agent": "Mozilla/5.0"}
+            timeout=10, headers={"User-Agent": UA}
         )
         rows = r.json().get("aaData", [])
         lines.append(f"✅ 上櫃 API 正常（{len(rows)} 筆）")
     except Exception as e:
-        lines.append(f"❌ 上櫃 API 失敗：{str(e)[:50]}")
+        lines.append(f"❌ 上櫃 API 失敗：{str(e)[:40]}")
 
-    # 執行一次篩選
-    try:
-        twse = fetch_twse()
-        tpex = fetch_tpex()
-        lines.append(f"\n📊 篩選結果：")
-        lines.append(f"上市符合條件：{len(twse)} 支")
-        lines.append(f"上櫃符合條件：{len(tpex)} 支")
-        if twse:
-            top = twse[0]
-            lines.append(f"最大量範例：{top['code']} {top['name']} +{top['pct']}% {top['vol']:,}張")
-    except Exception as e:
-        lines.append(f"篩選錯誤：{str(e)[:50]}")
+    # 篩選結果
+    twse = fetch_twse()
+    tpex = fetch_tpex()
+    lines.append(f"\n📊 篩選結果：")
+    lines.append(f"上市符合條件：{len(twse)} 支")
+    lines.append(f"上櫃符合條件：{len(tpex)} 支")
+    if twse:
+        t = twse[0]
+        lines.append(f"範例：{t['code']} {t['name']} +{t['pct']}% {t['vol']:,}張")
 
     return [{"type": "text", "text": "\n".join(lines)}]
 
 
 # ──────────────────────────────────────────────
-# 排程推播
+# 排程
 # ──────────────────────────────────────────────
 
 def push_report():
     if not USER_ID:
-        logger.warning("USER_ID not set")
         return
     now = datetime.now(TW_TZ)
     if now.weekday() >= 5:
@@ -325,29 +374,19 @@ def callback():
         if text in ["掃描", "篩選", "今天", "標的", "做空"]:
             reply(rt, [{"type": "text", "text": "⏳ 篩選中，請稍候 10~20 秒..."}])
             push(uid, build_messages(screen()))
-
         elif text == "測試":
             reply(rt, [{"type": "text", "text": "🔧 測試中，請稍候..."}])
             push(uid, build_test_message())
-
         elif text in ["說明", "help", "?"]:
             reply(rt, [{"type": "text", "text": (
                 "📋 指令說明\n\n"
-                "【篩選標的】\n"
-                "傳：掃描 / 篩選 / 今天 / 標的 / 做空\n\n"
-                "【系統測試】\n"
-                "傳：測試\n"
-                "→ 顯示 API 連線狀態與資料筆數\n\n"
-                "【自動推播】\n"
-                "每日 15:35 自動推播收盤篩選結果\n\n"
-                "篩選條件（大叔策略）：\n"
-                "• 今日漲幅 3~9.5%\n"
-                "• 成交量上市 1000 張以上\n"
-                "• 明日試撮留意量縮+漲不過 2.5%"
+                "【篩選標的】掃描 / 篩選 / 今天 / 標的 / 做空\n"
+                "【系統測試】測試\n"
+                "【自動推播】每日 15:35\n\n"
+                "篩選條件：漲幅 3~9.5% + 量能足夠"
             )}])
-
         else:
-            reply(rt, [{"type": "text", "text": "傳「掃描」篩選標的，傳「測試」檢查系統，傳「說明」查看所有指令。"}])
+            reply(rt, [{"type": "text", "text": "傳「掃描」篩選標的，傳「測試」檢查系統，傳「說明」查看指令。"}])
 
     return "OK"
 
