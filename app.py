@@ -320,7 +320,7 @@ def push_report():
 
 
 scheduler = BackgroundScheduler(timezone=TW_TZ)
-scheduler.add_job(push_report, "cron", day_of_week="mon-fri", hour=15, minute=35)
+scheduler.add_job(push_report, "cron", day_of_week="mon-fri", hour=13, minute=35)
 scheduler.start()
 
 
