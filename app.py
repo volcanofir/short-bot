@@ -6,7 +6,7 @@ import base64
 import requests
 from flask import Flask, request, abort
 from apscheduler.schedulers.background import BackgroundScheduler
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 import logging
 
@@ -19,7 +19,6 @@ TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 USER_ID = os.environ.get("LINE_USER_ID", "")
 TW_TZ = pytz.timezone("Asia/Taipei")
-
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
 
@@ -60,151 +59,176 @@ def verify_signature(body, sig):
 
 
 # ──────────────────────────────────────────────
-# 資料抓取
+# 資料抓取：FinMind（台灣開源金融平台，海外可存取）
 # ──────────────────────────────────────────────
 
-def parse_change(s):
-    """解析漲跌價差，處理各種格式"""
-    s = str(s).replace(",", "").strip()
-    if not s or s in ["--", "nan", ""]:
-        return None
-    # 證交所用 X 表示負號
-    if s.startswith("X") or s.startswith("x"):
-        s = "-" + s[1:]
-    s = s.replace("+", "")
-    try:
-        return float(s)
-    except Exception:
-        return None
+def get_today_str():
+    now = datetime.now(TW_TZ)
+    return now.strftime("%Y-%m-%d")
 
 
-def fetch_twse():
-    """上市股票，嘗試多個來源"""
+def fetch_finmind():
+    """
+    使用 FinMind 抓取台股當日收盤資料
+    API 文件：https://finmindtrade.com/analysis/#/data/document
+    不需要帳號即可使用（有頻率限制）
+    """
+    today = get_today_str()
+    url = "https://api.finmindtrade.com/api/v4/data"
     results = []
 
-    # 來源1：openapi（每日更新，有時早上還沒更新）
+    # 抓上市
     try:
-        r = requests.get(
-            "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
-            timeout=15, headers={"User-Agent": UA, "Accept": "application/json"}
-        )
+        params = {
+            "dataset": "TaiwanStockPrice",
+            "start_date": today,
+            "token": ""  # 免費版不需要 token
+        }
+        r = requests.get(url, params=params, timeout=20, headers={"User-Agent": UA})
         data = r.json()
-        if isinstance(data, list) and len(data) > 100:
-            logger.info(f"TWSE openapi: {len(data)} rows")
-            for item in data:
-                try:
-                    code = str(item.get("Code", "")).strip()
-                    name = str(item.get("Name", "")).strip()
-                    vol_str = str(item.get("TradeVolume", "0")).replace(",", "")
-                    close_str = str(item.get("ClosingPrice", "")).replace(",", "")
-                    chg = parse_change(item.get("Change", ""))
+        rows = data.get("data", [])
+        logger.info(f"FinMind TaiwanStockPrice: {len(rows)} rows")
 
-                    if not close_str or close_str in ["--", "0", ""] or chg is None:
-                        continue
-                    close = float(close_str)
-                    vol = int(float(vol_str)) // 1000
-                    prev = close - chg
-                    if prev <= 0 or close <= 0:
-                        continue
-                    pct = chg / prev * 100
-                    if 3.0 <= pct <= 9.5 and vol >= 1000:
-                        results.append({
-                            "market": "上市", "code": code, "name": name,
-                            "close": round(close, 2), "pct": round(pct, 2), "vol": vol,
-                            "signal": get_signal(pct, vol)
-                        })
-                except Exception:
-                    continue
-            if results:
-                return results
-    except Exception as e:
-        logger.error(f"TWSE openapi failed: {e}")
-
-    # 來源2：證交所 rwd API（備用）
-    try:
-        today = datetime.now(TW_TZ).strftime("%Y%m%d")
-        r = requests.get(
-            f"https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?response=json&date={today}&type=ALLBUT0999",
-            timeout=15, headers={"User-Agent": UA}
-        )
-        data = r.json()
-        for table in data.get("tables", []):
-            fields = table.get("fields", [])
-            if "漲跌價差" in fields and "成交股數" in fields:
-                rows = table.get("data", [])
-                logger.info(f"TWSE rwd: {len(rows)} rows")
-                fi = {f: i for i, f in enumerate(fields)}
-                for row in rows:
-                    try:
-                        code = str(row[fi.get("證券代號", 0)]).strip()
-                        name = str(row[fi.get("證券名稱", 1)]).strip()
-                        vol = int(str(row[fi.get("成交股數", 2)]).replace(",", "")) // 1000
-                        close = float(str(row[fi.get("收盤價", -1)]).replace(",", ""))
-                        chg = parse_change(row[fi.get("漲跌價差", -1)])
-                        if chg is None:
-                            continue
-                        prev = close - chg
-                        if prev <= 0:
-                            continue
-                        pct = chg / prev * 100
-                        if 3.0 <= pct <= 9.5 and vol >= 1000:
-                            results.append({
-                                "market": "上市", "code": code, "name": name,
-                                "close": round(close, 2), "pct": round(pct, 2), "vol": vol,
-                                "signal": get_signal(pct, vol)
-                            })
-                    except Exception:
-                        continue
-                if results:
-                    return results
-    except Exception as e:
-        logger.error(f"TWSE rwd failed: {e}")
-
-    return results
-
-
-def fetch_tpex():
-    """上櫃股票"""
-    today = datetime.now(TW_TZ)
-    roc = f"{today.year-1911}/{today.month:02d}/{today.day:02d}"
-    results = []
-    try:
-        r = requests.get(
-            f"https://www.tpex.org.tw/web/stock/aftertrading/otc_quotes_no1430/stk_wn1430_result.php?l=zh-tw&d={roc}&se=AL",
-            timeout=15, headers={"User-Agent": UA}
-        )
-        rows = r.json().get("aaData", [])
-        logger.info(f"TPEX: {len(rows)} rows")
         for row in rows:
             try:
-                code = str(row[0]).strip()
-                name = str(row[1]).strip()
-                close_str = str(row[2]).replace(",", "")
-                chg = parse_change(row[3])
-                vol_str = str(row[7]).replace(",", "")
-                if not close_str or close_str in ["--", ""] or chg is None:
+                code = str(row.get("stock_id", "")).strip()
+                close = float(row.get("close", 0))
+                open_p = float(row.get("open", 0))
+                prev_close = float(row.get("close", 0)) - float(row.get("spread", 0))
+                spread = float(row.get("spread", 0))
+                vol = int(row.get("Trading_Volume", 0)) // 1000
+
+                if prev_close <= 0 or close <= 0:
                     continue
-                close = float(close_str)
-                vol = int(float(vol_str)) // 1000
-                prev = close - chg
-                if prev <= 0:
+                pct = spread / prev_close * 100
+
+                # 排除ETF（代號長度>4或含英文字母）
+                if len(code) > 4 or not code.isdigit():
                     continue
-                pct = chg / prev * 100
-                if 3.0 <= pct <= 9.5 and vol >= 500:
+
+                if 3.0 <= pct <= 9.5 and vol >= 1000:
                     results.append({
-                        "market": "上櫃", "code": code, "name": name,
+                        "market": "上市", "code": code, "name": code,
                         "close": round(close, 2), "pct": round(pct, 2), "vol": vol,
                         "signal": get_signal(pct, vol)
                     })
             except Exception:
                 continue
+
     except Exception as e:
-        logger.error(f"TPEX error: {e}")
+        logger.error(f"FinMind fetch error: {e}")
+
+    return results
+
+
+def fetch_yahoo_movers():
+    """
+    使用 Yahoo Finance Taiwan 漲幅排行
+    這個 API 在海外完全可存取
+    """
+    results = []
+    today = get_today_str()
+
+    # Yahoo Finance Taiwan 漲幅排行 API
+    url = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
+    params = {
+        "formatted": "false",
+        "lang": "zh-TW",
+        "region": "TW",
+        "scrIds": "day_gainers",
+        "count": 100,
+        "start": 0
+    }
+    headers = {
+        "User-Agent": UA,
+        "Accept": "application/json",
+        "Referer": "https://tw.stock.yahoo.com/"
+    }
+
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=15)
+        data = r.json()
+        quotes = data.get("finance", {}).get("result", [{}])[0].get("quotes", [])
+        logger.info(f"Yahoo movers: {len(quotes)} stocks")
+
+        for q in quotes:
+            try:
+                symbol = q.get("symbol", "")
+                # 只要台灣股票（.TW 或 .TWO）
+                if not symbol.endswith(".TW") and not symbol.endswith(".TWO"):
+                    continue
+
+                code = symbol.replace(".TW", "").replace(".TWO", "")
+                name = q.get("shortName", "") or q.get("longName", code)
+                close = float(q.get("regularMarketPrice", 0))
+                pct = float(q.get("regularMarketChangePercent", 0))
+                vol = int(q.get("regularMarketVolume", 0)) // 1000
+                market = "上市" if symbol.endswith(".TW") else "上櫃"
+
+                if 3.0 <= pct <= 9.5 and vol >= 500:
+                    results.append({
+                        "market": market, "code": code, "name": name,
+                        "close": round(close, 2), "pct": round(pct, 2), "vol": vol,
+                        "signal": get_signal(pct, vol)
+                    })
+            except Exception:
+                continue
+
+    except Exception as e:
+        logger.error(f"Yahoo movers error: {e}")
+
+    # 備用：Yahoo Finance 台灣漲幅排行（另一個端點）
+    if not results:
+        try:
+            url2 = "https://query2.finance.yahoo.com/v1/finance/screener"
+            payload = {
+                "offset": 0,
+                "size": 100,
+                "sortField": "percentchange",
+                "sortType": "DESC",
+                "quoteType": "EQUITY",
+                "topOperator": "AND",
+                "query": {
+                    "operator": "AND",
+                    "operands": [
+                        {"operator": "EQ", "operands": ["region", "tw"]},
+                        {"operator": "GT", "operands": ["percentchange", 3]},
+                        {"operator": "LT", "operands": ["percentchange", 10]},
+                        {"operator": "GT", "operands": ["dayvolume", 500000]}
+                    ]
+                }
+            }
+            r = requests.post(url2, json=payload, headers=headers, timeout=15)
+            data = r.json()
+            quotes = data.get("finance", {}).get("result", [{}])[0].get("quotes", [])
+            logger.info(f"Yahoo screener: {len(quotes)} stocks")
+
+            for q in quotes:
+                try:
+                    symbol = q.get("symbol", "")
+                    code = symbol.replace(".TW", "").replace(".TWO", "")
+                    name = q.get("shortName", code)
+                    close = float(q.get("regularMarketPrice", 0))
+                    pct = float(q.get("regularMarketChangePercent", 0))
+                    vol = int(q.get("regularMarketVolume", 0)) // 1000
+                    market = "上市" if ".TW" in symbol else "上櫃"
+
+                    if 3.0 <= pct <= 9.5 and vol >= 500:
+                        results.append({
+                            "market": market, "code": code, "name": name,
+                            "close": round(close, 2), "pct": round(pct, 2), "vol": vol,
+                            "signal": get_signal(pct, vol)
+                        })
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.error(f"Yahoo screener error: {e}")
+
     return results
 
 
 # ──────────────────────────────────────────────
-# 篩選
+# 主篩選
 # ──────────────────────────────────────────────
 
 def get_signal(pct, vol):
@@ -213,15 +237,20 @@ def get_signal(pct, vol):
 
 
 def screen():
-    twse = fetch_twse()
-    tpex = fetch_tpex()
-    candidates = twse + tpex
+    # 優先用 Yahoo Finance（最穩定）
+    candidates = fetch_yahoo_movers()
+
+    # 如果 Yahoo 沒資料，試 FinMind
+    if not candidates:
+        logger.info("Yahoo empty, trying FinMind...")
+        candidates = fetch_finmind()
+
     candidates.sort(key=lambda x: x["vol"], reverse=True)
     return candidates[:10]
 
 
 # ──────────────────────────────────────────────
-# 訊息
+# 訊息組裝
 # ──────────────────────────────────────────────
 
 def build_messages(candidates):
@@ -281,53 +310,40 @@ def build_test_message():
     now = datetime.now(TW_TZ).strftime("%m/%d %H:%M")
     lines = [f"🔧 系統測試 {now}\n"]
 
-    # 測試 openapi
+    # 測試 Yahoo Finance
     try:
-        r = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
-                         timeout=10, headers={"User-Agent": UA})
-        data = r.json()
-        if isinstance(data, list) and len(data) > 0:
-            lines.append(f"✅ 上市 openapi 正常（{len(data)} 筆）")
-        else:
-            lines.append(f"⚠️ 上市 openapi 資料異常（{type(data)}）")
+        url = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
+        params = {"formatted": "false", "lang": "zh-TW", "region": "TW",
+                  "scrIds": "day_gainers", "count": 10}
+        r = requests.get(url, params=params, timeout=10,
+                         headers={"User-Agent": UA})
+        quotes = r.json().get("finance", {}).get("result", [{}])[0].get("quotes", [])
+        lines.append(f"✅ Yahoo Finance 正常（{len(quotes)} 筆）")
     except Exception as e:
-        lines.append(f"❌ 上市 openapi 失敗：{str(e)[:40]}")
+        lines.append(f"❌ Yahoo Finance 失敗：{str(e)[:50]}")
 
-    # 測試 rwd
+    # 測試 FinMind
     try:
-        today = datetime.now(TW_TZ).strftime("%Y%m%d")
+        today = get_today_str()
         r = requests.get(
-            f"https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?response=json&date={today}&type=ALLBUT0999",
+            "https://api.finmindtrade.com/api/v4/data",
+            params={"dataset": "TaiwanStockPrice", "start_date": today},
             timeout=10, headers={"User-Agent": UA}
         )
-        data = r.json()
-        tables = data.get("tables", [])
-        lines.append(f"✅ 上市 rwd API 正常（{len(tables)} 個表）")
+        rows = r.json().get("data", [])
+        lines.append(f"✅ FinMind 正常（{len(rows)} 筆）")
     except Exception as e:
-        lines.append(f"❌ 上市 rwd 失敗：{str(e)[:40]}")
+        lines.append(f"❌ FinMind 失敗：{str(e)[:50]}")
 
-    # 測試 TPEX
-    try:
-        today = datetime.now(TW_TZ)
-        roc = f"{today.year-1911}/{today.month:02d}/{today.day:02d}"
-        r = requests.get(
-            f"https://www.tpex.org.tw/web/stock/aftertrading/otc_quotes_no1430/stk_wn1430_result.php?l=zh-tw&d={roc}&se=AL",
-            timeout=10, headers={"User-Agent": UA}
-        )
-        rows = r.json().get("aaData", [])
-        lines.append(f"✅ 上櫃 API 正常（{len(rows)} 筆）")
-    except Exception as e:
-        lines.append(f"❌ 上櫃 API 失敗：{str(e)[:40]}")
-
-    # 篩選結果
-    twse = fetch_twse()
-    tpex = fetch_tpex()
-    lines.append(f"\n📊 篩選結果：")
-    lines.append(f"上市符合條件：{len(twse)} 支")
-    lines.append(f"上櫃符合條件：{len(tpex)} 支")
-    if twse:
-        t = twse[0]
-        lines.append(f"範例：{t['code']} {t['name']} +{t['pct']}% {t['vol']:,}張")
+    # 執行篩選
+    candidates = screen()
+    lines.append(f"\n📊 篩選結果：{len(candidates)} 支")
+    if candidates:
+        t = candidates[0]
+        lines.append(f"最大量：{t['code']} {t['name']}")
+        lines.append(f"+{t['pct']}% | {t['vol']:,} 張 | {t['signal']}")
+    else:
+        lines.append("（目前無符合條件標的）")
 
     return [{"type": "text", "text": "\n".join(lines)}]
 
