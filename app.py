@@ -3,10 +3,11 @@ import json
 import requests
 from flask import Flask, request
 from apscheduler.schedulers.background import BackgroundScheduler
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 import logging
 import threading
+import time
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -17,10 +18,8 @@ TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 TW_TZ = pytz.timezone("Asia/Taipei")
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-
 TG_API = f"https://api.telegram.org/bot{TG_TOKEN}"
 
-# 監控清單
 SYMBOLS = [
     "2330.TW","2317.TW","2454.TW","2382.TW","3711.TW","2308.TW","2303.TW",
     "2379.TW","2301.TW","2344.TW","2337.TW","2360.TW","3034.TW","3036.TW",
@@ -48,7 +47,7 @@ SYMBOLS = [
 
 
 # ──────────────────────────────────────────────
-# Telegram 訊息發送
+# Telegram 發送
 # ──────────────────────────────────────────────
 
 def tg_send(chat_id, text, parse_mode="HTML"):
@@ -63,14 +62,84 @@ def tg_send(chat_id, text, parse_mode="HTML"):
 
 
 # ──────────────────────────────────────────────
-# 資料抓取
+# 資料抓取：Yahoo v8 歷史資料（24小時可用）
 # ──────────────────────────────────────────────
 
-def fetch_quotes():
+def get_last_trading_day():
+    """取得最近的交易日（跳過週末）"""
+    now = datetime.now(TW_TZ)
+    d = now.date()
+    # 如果還沒收盤（13:30前），取前一個交易日
+    if now.hour < 14:
+        d -= timedelta(days=1)
+    # 跳過週末
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
+
+
+def fetch_stock_history(symbol):
+    """用 Yahoo v8 chart API 抓最近 5 天資料，計算最後交易日漲跌"""
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    params = {
+        "interval": "1d",
+        "range": "5d",
+        "includePrePost": "false"
+    }
+    headers = {"User-Agent": UA, "Accept": "application/json"}
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=8)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        result = data.get("chart", {}).get("result", [])
+        if not result:
+            return None
+        chart = result[0]
+        closes = chart.get("indicators", {}).get("quote", [{}])[0].get("close", [])
+        volumes = chart.get("indicators", {}).get("quote", [{}])[0].get("volume", [])
+        timestamps = chart.get("timestamp", [])
+
+        # 過濾掉 None
+        valid = [(t, c, v) for t, c, v in zip(timestamps, closes, volumes)
+                 if c is not None and v is not None]
+
+        if len(valid) < 2:
+            return None
+
+        # 最後兩個交易日
+        prev_close = valid[-2][1]
+        last_close = valid[-1][1]
+        last_vol = valid[-1][2]
+        last_ts = valid[-1][0]
+
+        if prev_close <= 0:
+            return None
+
+        pct = (last_close - prev_close) / prev_close * 100
+        vol = int(last_vol) // 1000
+
+        # 取名稱
+        name = chart.get("meta", {}).get("shortName", "") or symbol.replace(".TW", "").replace(".TWO", "")
+
+        return {
+            "close": round(last_close, 2),
+            "pct": round(pct, 2),
+            "vol": vol,
+            "name": name,
+            "ts": last_ts
+        }
+    except Exception:
+        return None
+
+
+def fetch_all():
+    """批次抓取所有股票，用 v7 quote 先快速篩，再用 v8 確認"""
     results = []
     headers = {"User-Agent": UA, "Accept": "application/json"}
-    batch_size = 100
 
+    # 先用 v7 quote 批次查（快速）
+    batch_size = 100
     for i in range(0, len(SYMBOLS), batch_size):
         batch = SYMBOLS[i:i+batch_size]
         symbols_str = ",".join(batch)
@@ -78,18 +147,31 @@ def fetch_quotes():
         try:
             r = requests.get(url, headers=headers, timeout=12)
             quotes = r.json().get("quoteResponse", {}).get("result", []) or []
+
             for q in quotes:
                 try:
                     symbol = str(q.get("symbol", ""))
                     code = symbol.replace(".TW", "").replace(".TWO", "")
                     name = q.get("shortName", "") or code
                     name = name.replace(" Corp.", "").replace(" Co.,Ltd.", "").strip()
+
+                    # 優先用即時資料
                     close = float(q.get("regularMarketPrice", 0) or 0)
                     pct = float(q.get("regularMarketChangePercent", 0) or 0)
                     vol = int(q.get("regularMarketVolume", 0) or 0) // 1000
-                    if close <= 0 or vol <= 0:
+                    prev_close = float(q.get("regularMarketPreviousClose", 0) or 0)
+
+                    # 如果即時資料沒有漲跌（非交易時段），用 52週資料推算
+                    # 改用 regularMarketChange
+                    chg = float(q.get("regularMarketChange", 0) or 0)
+                    if prev_close > 0 and close > 0:
+                        pct = chg / prev_close * 100
+
+                    if close <= 0:
                         continue
+
                     market = "上市" if symbol.endswith(".TW") else "上櫃"
+
                     if 3.0 <= pct <= 9.5 and vol >= 500:
                         results.append({
                             "market": market, "code": code, "name": name,
@@ -99,9 +181,26 @@ def fetch_quotes():
                 except Exception:
                     continue
         except Exception as e:
-            logger.error(f"Fetch batch error: {e}")
+            logger.error(f"v7 batch error: {e}")
 
-    logger.info(f"fetch_quotes: {len(results)} results")
+    # 如果 v7 沒有資料（非交易時段），改用 v8 歷史資料
+    if not results:
+        logger.info("v7 empty, trying v8 history...")
+        # 只查前50支（避免太慢）
+        for symbol in SYMBOLS[:80]:
+            data = fetch_stock_history(symbol)
+            if data and 3.0 <= data["pct"] <= 9.5 and data["vol"] >= 500:
+                code = symbol.replace(".TW", "").replace(".TWO", "")
+                market = "上市" if symbol.endswith(".TW") else "上櫃"
+                results.append({
+                    "market": market, "code": code,
+                    "name": data["name"] or code,
+                    "close": data["close"], "pct": data["pct"],
+                    "vol": data["vol"], "signal": get_signal(data["pct"], data["vol"])
+                })
+            time.sleep(0.05)  # 避免太快被擋
+
+    logger.info(f"fetch_all results: {len(results)}")
     return results
 
 
@@ -111,7 +210,7 @@ def get_signal(pct, vol):
 
 
 def screen():
-    candidates = fetch_quotes()
+    candidates = fetch_all()
     seen = {}
     for c in candidates:
         code = c["code"]
@@ -127,45 +226,63 @@ def screen():
 # ──────────────────────────────────────────────
 
 def format_report(candidates):
-    now = datetime.now(TW_TZ).strftime("%m/%d")
+    now = datetime.now(TW_TZ)
+    last_day = get_last_trading_day()
+    date_str = last_day.strftime("%m/%d")
+
     if not candidates:
         return (
-            f"📊 <b>{now} 收盤篩選完畢</b>\n\n"
+            f"📊 <b>{date_str} 收盤篩選完畢</b>\n\n"
             "今日無符合條件的標的\n"
             "（量能不足或漲幅不符合策略門檻）"
         )
 
-    lines = [f"📊 <b>{now} 明日做空觀察清單（{len(candidates)} 支）</b>\n"]
+    lines = [f"📊 <b>{date_str} 做空觀察清單（{len(candidates)} 支）</b>\n"]
     for c in candidates:
         est_vol = max(1, int(c["vol"] * 0.02))
         lines.append(
             f"{c['signal']} <b>{c['code']} {c['name']}</b> [{c['market']}]\n"
-            f"  收盤：<b>{c['close']}</b> 元  漲幅：<b>+{c['pct']}%</b>  量：<b>{c['vol']:,}</b> 張\n"
-            f"  📌 試撮 &lt;{est_vol:,}張 | 空點 &lt;{round(c['close']*1.025,1)}元 | 停損過高"
+            f"  收盤：<b>{c['close']}</b>元  漲幅：<b>+{c['pct']}%</b>  量：<b>{c['vol']:,}</b>張\n"
+            f"  📌 試撮&lt;{est_vol:,}張 | 空點&lt;{round(c['close']*1.025,1)}元 | 停損過高"
         )
 
-    lines.append("\n⚠️ 以上為明日觀察標的，需配合試撮量縮+趨勢確認再進場")
+    lines.append("\n⚠️ 需配合明日試撮量縮+趨勢確認再進場")
     return "\n".join(lines)
 
 
 def format_test():
     now = datetime.now(TW_TZ).strftime("%m/%d %H:%M")
-    lines = [f"🔧 <b>系統測試 {now}</b>\n"]
+    last_day = get_last_trading_day()
+    lines = [f"🔧 <b>系統測試 {now}</b>"]
+    lines.append(f"最近交易日：{last_day.strftime('%m/%d')}\n")
 
+    # 測試 v7
     try:
-        url = "https://query1.finance.yahoo.com/v7/finance/quote?symbols=2330.TW,2317.TW,2454.TW"
+        url = "https://query1.finance.yahoo.com/v7/finance/quote?symbols=2330.TW,2317.TW"
         r = requests.get(url, headers={"User-Agent": UA}, timeout=8)
         quotes = r.json().get("quoteResponse", {}).get("result", []) or []
-        lines.append(f"✅ Yahoo v7 API 正常（{len(quotes)} 筆）")
+        lines.append(f"✅ Yahoo v7：{len(quotes)} 筆")
         if quotes:
             q = quotes[0]
             price = q.get("regularMarketPrice", "?")
             pct = round(q.get("regularMarketChangePercent", 0), 2)
-            state = q.get("marketState", "")
-            lines.append(f"   台積電：{price}元 ({pct:+.2f}%) [{state}]")
+            prev = q.get("regularMarketPreviousClose", "?")
+            lines.append(f"   台積電：現價{price} 前收{prev} ({pct:+.2f}%)")
     except Exception as e:
-        lines.append(f"❌ Yahoo v7 失敗：{str(e)[:50]}")
+        lines.append(f"❌ v7 失敗：{str(e)[:40]}")
 
+    # 測試 v8 歷史
+    try:
+        data = fetch_stock_history("2330.TW")
+        if data:
+            lines.append(f"✅ Yahoo v8 歷史：正常")
+            lines.append(f"   台積電最後收盤：{data['close']} ({data['pct']:+.2f}%) {data['vol']:,}張")
+        else:
+            lines.append("⚠️ v8 歷史：無資料")
+    except Exception as e:
+        lines.append(f"❌ v8 失敗：{str(e)[:40]}")
+
+    # 篩選
     candidates = screen()
     lines.append(f"\n📊 篩選結果：{len(candidates)} 支")
     if candidates:
@@ -173,18 +290,16 @@ def format_test():
             lines.append(f"• {c['code']} {c['name']} +{c['pct']}% {c['vol']:,}張")
     else:
         lines.append("（目前無符合條件標的）")
-        lines.append("※ 請在收盤後 13:30~15:00 測試")
 
     return "\n".join(lines)
 
 
 # ──────────────────────────────────────────────
-# 排程推播
+# 排程
 # ──────────────────────────────────────────────
 
 def push_report():
     if not CHAT_ID:
-        logger.warning("CHAT_ID not set")
         return
     now = datetime.now(TW_TZ)
     if now.weekday() >= 5:
@@ -200,7 +315,7 @@ scheduler.start()
 
 
 # ──────────────────────────────────────────────
-# Telegram Polling（背景執行）
+# Telegram Polling
 # ──────────────────────────────────────────────
 
 last_update_id = 0
@@ -222,30 +337,32 @@ def handle_update(update):
 
     logger.info(f"Message from {chat_id}: {text}")
 
-    if text in ["/start", "掃描", "篩選", "今天", "標的", "做空", "/scan"]:
+    if text in ["/start", "/scan", "掃描", "篩選", "今天", "標的", "做空"]:
         tg_send(chat_id, "⏳ 篩選中，請稍候 15~25 秒...")
         candidates = screen()
         tg_send(chat_id, format_report(candidates))
 
-    elif text in ["測試", "/test"]:
+    elif text in ["/test", "測試"]:
         tg_send(chat_id, "🔧 測試中，請稍候...")
         tg_send(chat_id, format_test())
 
-    elif text in ["說明", "/help"]:
+    elif text in ["/id"]:
+        tg_send(chat_id, f"你的 Chat ID：\n<code>{chat_id}</code>")
+
+    elif text in ["/help", "說明"]:
         tg_send(chat_id, (
             "📋 <b>指令說明</b>\n\n"
-            "【篩選標的】\n/scan 或 掃描 / 篩選 / 做空\n\n"
-            "【系統測試】\n/test 或 測試\n\n"
-            "【取得我的 Chat ID】\n/id\n\n"
-            "【自動推播】\n每日 13:35 自動推播\n\n"
-            "篩選條件：漲幅 3~9.5% + 量能足夠"
+            "/scan — 篩選做空標的（任何時間可用）\n"
+            "/test — 系統測試\n"
+            "/id — 查詢你的 Chat ID\n"
+            "/help — 說明\n\n"
+            "⏰ 每日 13:35 自動推播\n"
+            "📊 篩選條件：漲幅 3~9.5% + 量能足夠\n"
+            "✅ 資料來源：Yahoo Finance（24小時可查）"
         ))
 
-    elif text in ["/id"]:
-        tg_send(chat_id, f"你的 Chat ID 是：\n<code>{chat_id}</code>")
-
     else:
-        tg_send(chat_id, "傳 /scan 篩選標的，傳 /test 測試系統，傳 /help 查看說明。")
+        tg_send(chat_id, "傳 /scan 篩選標的，/test 測試系統，/help 查看說明。")
 
 
 def polling_loop():
@@ -263,17 +380,15 @@ def polling_loop():
                 handle_update(update)
         except Exception as e:
             logger.error(f"Polling error: {e}")
-            import time
             time.sleep(5)
 
 
-# 在背景執行 polling
 polling_thread = threading.Thread(target=polling_loop, daemon=True)
 polling_thread.start()
 
 
 # ──────────────────────────────────────────────
-# Flask（讓 Render 保持運行）
+# Flask
 # ──────────────────────────────────────────────
 
 @app.route("/")
