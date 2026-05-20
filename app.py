@@ -1,5 +1,4 @@
 import os
-import json
 import re
 import requests
 from flask import Flask, request
@@ -15,7 +14,6 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# ── 環境變數 ──
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 LINE_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
@@ -96,7 +94,6 @@ SYMBOLS = [
 # ──────────────────────────────────────────────
 
 def tg_send(chat_id, text, parse_mode="HTML"):
-    """發送到 Telegram"""
     try:
         requests.post(
             f"{TG_API}/sendMessage",
@@ -108,37 +105,52 @@ def tg_send(chat_id, text, parse_mode="HTML"):
 
 
 def line_send(text):
-    """發送到 LINE（使用 LINE Messaging API push message）"""
     if not LINE_TOKEN or not LINE_USER_ID:
         return
     try:
-        # 移除 HTML 標籤，LINE 用純文字
         clean = re.sub(r'<[^>]+>', '', text)
-        # 移除多餘空行
         clean = re.sub(r'\n{3,}', '\n\n', clean).strip()
-
         requests.post(
             "https://api.line.me/v2/bot/message/push",
             headers={
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {LINE_TOKEN}"
             },
-            json={
-                "to": LINE_USER_ID,
-                "messages": [{"type": "text", "text": clean}]
-            },
+            json={"to": LINE_USER_ID, "messages": [{"type": "text", "text": clean}]},
             timeout=10
         )
-        logger.info("LINE sent successfully")
+        logger.info("LINE sent OK")
     except Exception as e:
         logger.error(f"LINE send error: {e}")
 
 
 def broadcast(tg_chat_id, text):
-    """同時發送到 Telegram 和 LINE"""
     if tg_chat_id:
         tg_send(tg_chat_id, text)
     line_send(text)
+
+
+# ──────────────────────────────────────────────
+# 日期工具
+# ──────────────────────────────────────────────
+
+def get_last_trading_day():
+    """取得最近收盤的交易日"""
+    now = datetime.now(TW_TZ)
+    d = now.date()
+    if now.hour < 13 or (now.hour == 13 and now.minute < 30):
+        d -= timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
+
+
+def get_next_trading_day(d):
+    """取得下一個交易日"""
+    next_d = d + timedelta(days=1)
+    while next_d.weekday() >= 5:
+        next_d += timedelta(days=1)
+    return next_d
 
 
 # ──────────────────────────────────────────────
@@ -158,14 +170,9 @@ def calc_trade(close):
     }
 
 
-def get_last_trading_day():
-    now = datetime.now(TW_TZ)
-    d = now.date()
-    if now.hour < 13 or (now.hour == 13 and now.minute < 30):
-        d -= timedelta(days=1)
-    while d.weekday() >= 5:
-        d -= timedelta(days=1)
-    return d
+def get_signal(pct, vol):
+    score = (2 if 3 <= pct <= 6 else 1) + (2 if vol >= 10000 else 1 if vol >= 3000 else 0)
+    return "🔴 高度關注" if score >= 3 else "🟡 值得觀察" if score >= 2 else "⚪ 備選"
 
 
 # ──────────────────────────────────────────────
@@ -205,7 +212,6 @@ def fetch_stock_history(symbol, days=5):
 
 
 def fetch_intraday(symbol, target_date):
-    """抓取特定日期開盤後1小時的盤中資料"""
     now = datetime.now(TW_TZ)
     days_ago = (now.date() - target_date).days
     interval = "1m" if days_ago <= 6 else "1h"
@@ -225,29 +231,24 @@ def fetch_intraday(symbol, target_date):
         q = chart.get("indicators", {}).get("quote", [{}])[0]
         highs = q.get("high", [])
         lows = q.get("low", [])
-        closes = q.get("close", [])
         timestamps = chart.get("timestamp", [])
 
         open_highs, open_lows = [], []
-        for ts, h, l, c in zip(timestamps, highs, lows, closes):
+        for ts, h, l in zip(timestamps, highs, lows):
             if h is None or l is None:
                 continue
             dt = datetime.fromtimestamp(ts, TW_TZ)
             if dt.date() != target_date:
                 continue
-            open_time = dt.replace(hour=9, minute=0, second=0, microsecond=0)
-            close_time = dt.replace(hour=10, minute=0, second=0, microsecond=0)
-            if open_time <= dt <= close_time:
+            open_t = dt.replace(hour=9, minute=0, second=0, microsecond=0)
+            close_t = dt.replace(hour=10, minute=0, second=0, microsecond=0)
+            if open_t <= dt <= close_t:
                 open_highs.append(h)
                 open_lows.append(l)
 
         if not open_highs:
             return None
-        return {
-            "max_high": max(open_highs),
-            "min_low": min(open_lows),
-            "interval": interval
-        }
+        return {"max_high": max(open_highs), "min_low": min(open_lows), "interval": interval}
     except Exception as e:
         logger.error(f"Intraday error {symbol}: {e}")
         return None
@@ -307,11 +308,6 @@ def fetch_all():
 
     logger.info(f"fetch_all: {len(results)} results")
     return results
-
-
-def get_signal(pct, vol):
-    score = (2 if 3 <= pct <= 6 else 1) + (2 if vol >= 10000 else 1 if vol >= 3000 else 0)
-    return "🔴 高度關注" if score >= 3 else "🟡 值得觀察" if score >= 2 else "⚪ 備選"
 
 
 def screen():
@@ -400,7 +396,7 @@ def backtest_symbol(symbol, period_days):
                 ivl = intraday["interval"]
 
                 if h1_high >= watch_line:
-                    continue  # 不進場，不計入
+                    continue  # 不進場不計入
                 elif h1_high >= stop_price:
                     profit = round(-(stop_price - today["close"]) / today["close"] * 100, 2)
                     result_type = f"停損（{ivl}）"
@@ -459,27 +455,32 @@ def run_backtest(period_days):
 
 def format_report(candidates):
     last_day = get_last_trading_day()
-    date_str = last_day.strftime("%m/%d")
+    next_day = get_next_trading_day(last_day)
+    last_str = last_day.strftime("%m/%d")
+    next_str = next_day.strftime("%m/%d")
+
     if not candidates:
         return (
-            f"📊 <b>{date_str} 收盤篩選完畢</b>\n\n"
+            f"📊 <b>{last_str} 收盤篩選完畢</b>\n\n"
             "今日無符合條件的標的\n"
             "（量能不足、漲幅不符或股價超過千元）"
         )
-    lines = [f"📊 <b>{date_str} 做空觀察清單（{len(candidates)} 支）</b>\n"]
+
+    lines = [f"📊 <b>{last_str} 收盤篩選｜{next_str} 觀察名單（{len(candidates)} 支）</b>\n"]
     for c in candidates:
         est_vol = max(1, int(c["vol"] * 0.02))
         lines.append(
             f"{c['signal']} <b>{c['code']} {c['name']}</b> [{c['market']}]\n"
-            f"  昨收：<b>{c['close']}</b>元  漲幅：<b>+{c['pct']}%</b>  量：<b>{c['vol']:,}</b>張\n"
+            f"  {last_str}收：<b>{c['close']}</b>元  漲幅：<b>+{c['pct']}%</b>  量：<b>{c['vol']:,}</b>張\n"
             f"  ━━━━━━━━━━━━\n"
-            f"  👁 觀察空點：漲不過 <b>{c['watch_line']}</b> 元（+2.5%）才考慮空\n"
+            f"  👁 {next_str} 觀察空點：漲不過 <b>{c['watch_line']}</b> 元（+2.5%）才考慮空\n"
             f"  🛑 停損參考：<b>{c['stop_ref']}</b> 元（+{c['stop_pct']}%，實際以早盤高點為準）\n"
             f"  💰 目標參考：<b>{c['target_ref']}</b> 元（-{c['target_pct']}%，賺賠比 2:1）\n"
             f"  📌 試撮量需低於 {est_vol:,} 張"
         )
+
     lines.append(
-        "\n⚠️ <b>進場前需確認：</b>\n"
+        f"\n⚠️ <b>{next_str} 進場前需確認：</b>\n"
         "① 試撮量縮（低於上方門檻）\n"
         "② 漲不過觀察空點\n"
         "③ 趨勢線形成後再空\n"
@@ -546,7 +547,12 @@ def format_backtest(period_days, symbol_results, all_trades):
 def format_test():
     now = datetime.now(TW_TZ).strftime("%m/%d %H:%M")
     last_day = get_last_trading_day()
-    lines = [f"🔧 <b>系統測試 {now}</b>", f"最近交易日：{last_day.strftime('%m/%d')}\n"]
+    next_day = get_next_trading_day(last_day)
+    lines = [
+        f"🔧 <b>系統測試 {now}</b>",
+        f"收盤日：{last_day.strftime('%m/%d')} → 觀察日：{next_day.strftime('%m/%d')}\n"
+    ]
+
     try:
         url = "https://query1.finance.yahoo.com/v7/finance/quote?symbols=2330.TW,2615.TW"
         r = requests.get(url, headers={"User-Agent": UA}, timeout=8)
@@ -557,6 +563,7 @@ def format_test():
             lines.append(f"   台積電：{q.get('regularMarketPrice')}元 ({round(q.get('regularMarketChangePercent',0),2):+.2f}%)")
     except Exception as e:
         lines.append(f"❌ v7 失敗：{str(e)[:40]}")
+
     try:
         data = fetch_stock_history("2615.TW")
         if data:
@@ -565,7 +572,7 @@ def format_test():
     except Exception as e:
         lines.append(f"❌ v8 失敗：{str(e)[:40]}")
 
-    lines.append(f"\nLINE 推播：{'✅ 已設定' if LINE_TOKEN and LINE_USER_ID else '❌ 未設定'}")
+    lines.append(f"LINE 推播：{'✅ 已設定' if LINE_TOKEN and LINE_USER_ID else '❌ 未設定'}")
 
     candidates = screen()
     lines.append(f"\n📊 篩選結果：{len(candidates)} 支")
