@@ -20,9 +20,6 @@ TW_TZ = pytz.timezone("Asia/Taipei")
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 TG_API = f"https://api.telegram.org/bot{TG_TOKEN}"
 
-# ──────────────────────────────────────────────
-# 中文股票名稱對照表
-# ──────────────────────────────────────────────
 STOCK_NAMES = {
     "2330": "台積電", "2317": "鴻海", "2454": "聯發科", "2382": "廣達",
     "3711": "日月光投控", "2308": "台達電", "2303": "聯電", "2379": "瑞昱",
@@ -54,15 +51,13 @@ STOCK_NAMES = {
     "2492": "華新科", "3013": "映泰", "2474": "可成", "6443": "元晶",
     "3533": "嘉聯益", "6409": "旭隼", "2412": "中華電", "4938": "和碩",
     "3006": "晶豪科", "2327": "國巨", "2356": "英業達", "2324": "仁寶",
-    "2352": "佳世達", "2358": "廷鑫", "2377": "微星", "2383": "台光電",
-    "2392": "正崴", "2405": "訊碁", "2498": "宏達電", "5871": "中租-KY",
-    "3481": "群創", "2393": "億光", "6147": "頎邦", "2363": "矽統",
-    "3045": "台灣大", "6789": "采鈺", "6269": "台郡", "3622": "洋基工程",
-    "6265": "方土昊", "3583": "辛耘", "4961": "天鈺", "6191": "精成科",
-    "8112": "至上", "6756": "立積", "6679": "鈺太", "6477": "安集",
-    "6446": "藥華藥", "3653": "健策", "3189": "景碩", "4763": "材料-KY",
-    "5269": "祥碩", "6227": "佳必琪", "3311": "閎康", "2105": "正新",
-    "1402": "遠東新", "9904": "寶成",
+    "2352": "佳世達", "2377": "微星", "2383": "台光電", "2392": "正崴",
+    "2405": "訊碁", "2498": "宏達電", "5871": "中租-KY", "3481": "群創",
+    "2393": "億光", "6147": "頎邦", "2363": "矽統", "3045": "台灣大",
+    "6789": "采鈺", "6269": "台郡", "3583": "辛耘", "4961": "天鈺",
+    "6191": "精成科", "8112": "至上", "6756": "立積", "6679": "鈺太",
+    "6477": "安集", "6446": "藥華藥", "3653": "健策", "3189": "景碩",
+    "5269": "祥碩", "6227": "佳必琪", "3311": "閎康",
 }
 
 SYMBOLS = [
@@ -83,39 +78,12 @@ SYMBOLS = [
     "8046.TW","6415.TW","3016.TW","2429.TW","6285.TW","3694.TW","2441.TW",
     "2913.TW","3702.TW","6239.TW","2492.TW","3013.TW","2474.TW","6443.TW",
     "3533.TW","6409.TW","2412.TW","4938.TW","3006.TW","2327.TW","2356.TW",
-    "2324.TW","2352.TW","2358.TW","2377.TW","2383.TW","2392.TW","2405.TW",
-    "2498.TW","5871.TW","3481.TW","2393.TW","6147.TW","2363.TW","3045.TW",
-    "6789.TWO","6269.TWO","3622.TWO","6265.TWO","3583.TWO","4961.TWO",
-    "6191.TWO","8112.TWO","6756.TWO","6679.TWO","6477.TWO","6446.TWO",
-    "3653.TWO","3189.TWO","4763.TWO","5269.TWO","6227.TWO","3311.TWO",
+    "2324.TW","2352.TW","2377.TW","2383.TW","2392.TW","2405.TW","2498.TW",
+    "5871.TW","3481.TW","2393.TW","6147.TW","2363.TW","3045.TW",
+    "6789.TWO","6269.TWO","3583.TWO","4961.TWO","6191.TWO","8112.TWO",
+    "6756.TWO","6679.TWO","6477.TWO","6446.TWO","3653.TWO","3189.TWO",
+    "5269.TWO","6227.TWO","3311.TWO",
 ]
-
-
-# ──────────────────────────────────────────────
-# 進場/停損/目標價計算（大叔策略）
-# ──────────────────────────────────────────────
-
-def calc_trade(close, pct):
-    """
-    大叔策略進場建議：
-    - 進場：隔日開盤後小拉升 1% 時掛高空（比收盤高 1%）
-    - 停損：過早盤高點（比進場再高 1%）
-    - 目標：2:1 賺賠比（停損幅度的 2 倍獲利）
-    """
-    entry = round(close * 1.010, 1)       # 進場：收盤 +1%（等反彈掛空）
-    stop = round(close * 1.020, 1)        # 停損：進場 +1%（即收盤 +2%）
-    risk = entry - stop                    # 風險（負值）
-    target = round(entry + risk * 2, 1)   # 目標：2倍賺賠比（往下）
-    stop_pct = round((stop - entry) / entry * 100, 2)
-    target_pct = round((entry - target) / entry * 100, 2)
-
-    return {
-        "entry": entry,
-        "stop": stop,
-        "target": target,
-        "stop_pct": abs(stop_pct),
-        "target_pct": target_pct
-    }
 
 
 # ──────────────────────────────────────────────
@@ -134,6 +102,23 @@ def tg_send(chat_id, text, parse_mode="HTML"):
 
 
 # ──────────────────────────────────────────────
+# 進場參考計算
+# ──────────────────────────────────────────────
+
+def calc_trade(close):
+    watch_line = round(close * 1.025, 1)
+    stop_ref = round(close * 1.020, 1)
+    risk = stop_ref - close
+    target_ref = round(close - risk * 2, 1)
+    stop_pct = round(risk / close * 100, 2)
+    target_pct = round(risk * 2 / close * 100, 2)
+    return {
+        "watch_line": watch_line, "stop_ref": stop_ref,
+        "target_ref": target_ref, "stop_pct": stop_pct, "target_pct": target_pct
+    }
+
+
+# ──────────────────────────────────────────────
 # 資料抓取
 # ──────────────────────────────────────────────
 
@@ -147,9 +132,9 @@ def get_last_trading_day():
     return d
 
 
-def fetch_stock_history(symbol):
+def fetch_stock_history(symbol, days=5):
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-    params = {"interval": "1d", "range": "5d", "includePrePost": "false"}
+    params = {"interval": "1d", "range": f"{days}d", "includePrePost": "false"}
     try:
         r = requests.get(url, params=params, headers={"User-Agent": UA}, timeout=8)
         if r.status_code != 200:
@@ -173,7 +158,8 @@ def fetch_stock_history(symbol):
             return None
         pct = (last_close - prev_close) / prev_close * 100
         vol = int(last_vol) // 1000
-        return {"close": round(last_close, 2), "pct": round(pct, 2), "vol": vol}
+        return {"close": round(last_close, 2), "pct": round(pct, 2),
+                "vol": vol, "all": valid}
     except Exception:
         return None
 
@@ -181,9 +167,8 @@ def fetch_stock_history(symbol):
 def fetch_all():
     results = []
     headers = {"User-Agent": UA, "Accept": "application/json"}
-
-    # v7 即時報價
     batch_size = 100
+
     for i in range(0, len(SYMBOLS), batch_size):
         batch = SYMBOLS[i:i+batch_size]
         url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={','.join(batch)}"
@@ -204,19 +189,17 @@ def fetch_all():
                     pct = chg / prev * 100
                     market = "上市" if symbol.endswith(".TW") else "上櫃"
                     if 3.0 <= pct <= 9.5 and vol >= 500:
-                        trade = calc_trade(close, pct)
+                        trade = calc_trade(close)
                         results.append({
                             "market": market, "code": code, "name": name,
                             "close": round(close, 2), "pct": round(pct, 2),
-                            "vol": vol, "signal": get_signal(pct, vol),
-                            **trade
+                            "vol": vol, "signal": get_signal(pct, vol), **trade
                         })
                 except Exception:
                     continue
         except Exception as e:
             logger.error(f"v7 error: {e}")
 
-    # 非交易時段改用 v8 歷史資料
     if not results:
         logger.info("v7 empty, using v8 history...")
         for symbol in SYMBOLS[:100]:
@@ -225,7 +208,7 @@ def fetch_all():
                 code = symbol.replace(".TW", "").replace(".TWO", "")
                 market = "上市" if symbol.endswith(".TW") else "上櫃"
                 name = STOCK_NAMES.get(code, code)
-                trade = calc_trade(data["close"], data["pct"])
+                trade = calc_trade(data["close"])
                 results.append({
                     "market": market, "code": code, "name": name,
                     "close": data["close"], "pct": data["pct"],
@@ -256,6 +239,159 @@ def screen():
 
 
 # ──────────────────────────────────────────────
+# 回測功能
+# ──────────────────────────────────────────────
+
+def backtest_symbol(symbol, period_days):
+    """
+    回測單支股票：
+    找出 period_days 內符合篩選條件的日子（當日漲 3~9.5%）
+    檢查隔日收盤是否比當日收盤低（做空有獲利）
+    計算平均報酬率
+    """
+    range_map = {7: "1mo", 15: "1mo", 30: "3mo"}
+    range_str = range_map.get(period_days, "1mo")
+
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    params = {"interval": "1d", "range": range_str, "includePrePost": "false"}
+    try:
+        r = requests.get(url, params=params, headers={"User-Agent": UA}, timeout=8)
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        result = data.get("chart", {}).get("result", [])
+        if not result:
+            return []
+        chart = result[0]
+        closes = chart.get("indicators", {}).get("quote", [{}])[0].get("close", [])
+        volumes = chart.get("indicators", {}).get("quote", [{}])[0].get("volume", [])
+        timestamps = chart.get("timestamp", [])
+
+        valid = [(datetime.fromtimestamp(t, TW_TZ).date(), c, v)
+                 for t, c, v in zip(timestamps, closes, volumes)
+                 if c is not None and v is not None]
+
+        if len(valid) < 3:
+            return []
+
+        # 只看 period_days 內的資料
+        cutoff = (datetime.now(TW_TZ) - timedelta(days=period_days)).date()
+        valid = [x for x in valid if x[0] >= cutoff]
+
+        trades = []
+        for i in range(1, len(valid) - 1):
+            date, close, vol = valid[i]
+            prev_close = valid[i-1][1]
+            next_close = valid[i+1][1]
+
+            if prev_close <= 0 or close <= 0:
+                continue
+
+            pct = (close - prev_close) / prev_close * 100
+            vol_k = int(vol) // 1000
+
+            # 符合做空條件：當日漲 3~9.5%，量足夠
+            if 3.0 <= pct <= 9.5 and vol_k >= 500:
+                # 隔日收盤報酬（做空：收跌才賺）
+                next_pct = (next_close - close) / close * 100
+                profit = -next_pct  # 做空時，跌 = 賺
+                trades.append({
+                    "date": date.strftime("%m/%d"),
+                    "close": round(close, 2),
+                    "pct": round(pct, 2),
+                    "next_close": round(next_close, 2),
+                    "profit": round(profit, 2),
+                    "win": profit > 0
+                })
+
+        return trades
+    except Exception as e:
+        logger.error(f"Backtest error {symbol}: {e}")
+        return []
+
+
+def run_backtest(period_days):
+    """對監控清單中的熱門股做回測"""
+    tg_send(CHAT_ID or "", f"🔄 回測中（近{period_days}天），請稍候約30秒...")
+
+    # 只回測前30支（避免太慢）
+    test_symbols = SYMBOLS[:30]
+    all_trades = []
+    symbol_results = {}
+
+    for symbol in test_symbols:
+        trades = backtest_symbol(symbol, period_days)
+        if trades:
+            code = symbol.replace(".TW", "").replace(".TWO", "")
+            name = STOCK_NAMES.get(code, code)
+            wins = sum(1 for t in trades if t["win"])
+            total = len(trades)
+            avg_profit = sum(t["profit"] for t in trades) / total
+            symbol_results[code] = {
+                "name": name, "total": total, "wins": wins,
+                "win_rate": round(wins/total*100, 1),
+                "avg_profit": round(avg_profit, 2),
+                "trades": trades
+            }
+            all_trades.extend(trades)
+        time.sleep(0.1)
+
+    return symbol_results, all_trades
+
+
+def format_backtest(period_days, symbol_results, all_trades):
+    lines = [f"📈 <b>回測報告（近 {period_days} 天）</b>\n"]
+
+    if not all_trades:
+        lines.append("此期間無符合條件的交易機會")
+        return "\n".join(lines)
+
+    # 整體統計
+    total = len(all_trades)
+    wins = sum(1 for t in all_trades if t["win"])
+    win_rate = round(wins / total * 100, 1)
+    avg_profit = round(sum(t["profit"] for t in all_trades) / total, 2)
+    total_profit = round(sum(t["profit"] for t in all_trades), 2)
+
+    lines.append(
+        f"📊 <b>整體統計</b>\n"
+        f"  交易次數：{total} 次\n"
+        f"  勝率：<b>{win_rate}%</b>（{wins}勝{total-wins}敗）\n"
+        f"  平均報酬：<b>{avg_profit:+.2f}%</b>\n"
+        f"  累積報酬：<b>{total_profit:+.2f}%</b>\n"
+    )
+
+    # 各股表現（只顯示有超過2次交易的）
+    good = [(code, r) for code, r in symbol_results.items()
+            if r["total"] >= 2 and r["win_rate"] >= 50]
+    good.sort(key=lambda x: x[1]["win_rate"], reverse=True)
+
+    if good:
+        lines.append("🏆 <b>勝率較高的標的：</b>")
+        for code, r in good[:5]:
+            lines.append(
+                f"  {code} {r['name']}：{r['win_rate']}% "
+                f"（{r['wins']}/{r['total']}）平均 {r['avg_profit']:+.2f}%"
+            )
+
+    # 最近幾筆交易
+    recent = sorted(all_trades, key=lambda x: x["date"], reverse=True)[:5]
+    lines.append("\n📅 <b>最近交易記錄：</b>")
+    for t in recent:
+        icon = "✅" if t["win"] else "❌"
+        lines.append(
+            f"  {icon} {t['date']} 收{t['close']} +{t['pct']}% "
+            f"→ 隔日{t['next_close']} ({t['profit']:+.2f}%)"
+        )
+
+    lines.append(
+        "\n⚠️ 回測為理想條件下的隔日收盤計算\n"
+        "實際操作須配合試撮量縮+趨勢確認"
+    )
+    return "\n".join(lines)
+
+
+# ──────────────────────────────────────────────
 # 訊息格式
 # ──────────────────────────────────────────────
 
@@ -271,16 +407,15 @@ def format_report(candidates):
         )
 
     lines = [f"📊 <b>{date_str} 做空觀察清單（{len(candidates)} 支）</b>\n"]
-
     for c in candidates:
         est_vol = max(1, int(c["vol"] * 0.02))
         lines.append(
             f"{c['signal']} <b>{c['code']} {c['name']}</b> [{c['market']}]\n"
             f"  昨收：<b>{c['close']}</b>元  漲幅：<b>+{c['pct']}%</b>  量：<b>{c['vol']:,}</b>張\n"
             f"  ━━━━━━━━━━━━\n"
-            f"  🎯 進場掛空：<b>{c['entry']}</b> 元（開盤拉升 1% 時）\n"
-            f"  🛑 停損價：<b>{c['stop']}</b> 元（+{c['stop_pct']}%，過高即停損）\n"
-            f"  💰 目標價：<b>{c['target']}</b> 元（-{c['target_pct']}%，賺賠比 2:1）\n"
+            f"  👁 觀察空點：漲不過 <b>{c['watch_line']}</b> 元（+2.5%）才考慮空\n"
+            f"  🛑 停損參考：<b>{c['stop_ref']}</b> 元（+{c['stop_pct']}%，實際以早盤高點為準）\n"
+            f"  💰 目標參考：<b>{c['target_ref']}</b> 元（-{c['target_pct']}%，賺賠比 2:1）\n"
             f"  📌 試撮量需低於 {est_vol:,} 張"
         )
 
@@ -324,7 +459,7 @@ def format_test():
     if candidates:
         for c in candidates[:3]:
             lines.append(f"• {c['code']} {c['name']} +{c['pct']}% {c['vol']:,}張")
-            lines.append(f"  進場:{c['entry']} 停損:{c['stop']} 目標:{c['target']}")
+            lines.append(f"  觀察:{c['watch_line']} 停損參考:{c['stop_ref']} 目標參考:{c['target_ref']}")
     else:
         lines.append("（目前無符合條件標的）")
 
@@ -375,24 +510,45 @@ def handle_update(update):
     if text in ["/start", "/scan", "掃描", "篩選", "今天", "標的", "做空"]:
         tg_send(chat_id, "⏳ 篩選中，請稍候 15~25 秒...")
         tg_send(chat_id, format_report(screen()))
+
     elif text in ["/test", "測試"]:
         tg_send(chat_id, "🔧 測試中，請稍候...")
         tg_send(chat_id, format_test())
+
+    elif text in ["/bt7", "回測7", "回測一週"]:
+        tg_send(chat_id, "📈 回測近7天，請稍候...")
+        results, trades = run_backtest(7)
+        tg_send(chat_id, format_backtest(7, results, trades))
+
+    elif text in ["/bt15", "回測15", "回測半個月"]:
+        tg_send(chat_id, "📈 回測近15天，請稍候...")
+        results, trades = run_backtest(15)
+        tg_send(chat_id, format_backtest(15, results, trades))
+
+    elif text in ["/bt30", "回測30", "回測一個月"]:
+        tg_send(chat_id, "📈 回測近30天，請稍候...")
+        results, trades = run_backtest(30)
+        tg_send(chat_id, format_backtest(30, results, trades))
+
     elif text in ["/id"]:
         tg_send(chat_id, f"你的 Chat ID：\n<code>{chat_id}</code>")
+
     elif text in ["/help", "說明"]:
         tg_send(chat_id, (
             "📋 <b>指令說明</b>\n\n"
-            "/scan — 篩選做空標的\n"
+            "/scan — 篩選今日做空標的\n"
+            "/bt7 — 回測近7天績效\n"
+            "/bt15 — 回測近15天績效\n"
+            "/bt30 — 回測近30天績效\n"
             "/test — 系統測試\n"
             "/id — 查詢 Chat ID\n"
             "/help — 說明\n\n"
             "⏰ 每日 13:35 自動推播\n"
-            "📊 篩選：漲幅 3~9.5% + 量能足夠\n"
             "💡 非交易時段自動顯示昨日資料"
         ))
+
     else:
-        tg_send(chat_id, "傳 /scan 篩選標的，/test 測試，/help 說明。")
+        tg_send(chat_id, "傳 /scan 篩選標的，/bt30 回測績效，/help 查看全部指令。")
 
 
 def polling_loop():
