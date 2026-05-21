@@ -511,6 +511,71 @@ def calc_pnl(entry, exit_price, lots=1):
     return round(gross), round(net)
 
 
+
+def find_exit_time(code, entry_time_str, target, stop):
+    """
+    用 Fugle 分鐘K找到目標價或停損的精確觸及時間
+    entry_time_str: "HH:MM" 格式的進場時間
+    target: 目標價（空單往下）
+    stop: 停損價（空單往上）
+    回傳 (exit_time_str, exit_price, result_type)
+    """
+    if not FUGLE_TOKEN:
+        return None, None, None
+    try:
+        url = f"https://api.fugle.tw/marketdata/v1.0/stock/intraday/candles/{code}"
+        r = requests.get(url,
+                         headers={"X-API-KEY": FUGLE_TOKEN},
+                         params={"timeFrame": 1},  # 1分K
+                         timeout=10)
+        if r.status_code != 200:
+            return None, None, None
+
+        data = r.json()
+        candles = data.get("candles", [])
+        if not candles:
+            return None, None, None
+
+        today = datetime.now(TW_TZ).date()
+
+        # 解析進場時間
+        entry_h, entry_m = map(int, entry_time_str.split(":"))
+        entry_dt = datetime.now(TW_TZ).replace(
+            hour=entry_h, minute=entry_m, second=0, microsecond=0)
+
+        for c in candles:
+            try:
+                t_str = c.get("date", "") or c.get("datetime", "")
+                if not t_str:
+                    continue
+                if "T" in t_str:
+                    dt = datetime.fromisoformat(
+                        t_str.replace("Z", "+00:00")).astimezone(TW_TZ)
+                else:
+                    dt = datetime.strptime(
+                        t_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=TW_TZ)
+
+                # 只看今天、進場時間之後的K棒
+                if dt.date() != today or dt < entry_dt:
+                    continue
+
+                high = c.get("high", 0)
+                low = c.get("low", 0)
+                t_str_out = dt.strftime("%H:%M")
+
+                # 同一根K棒先判斷停損（保守）
+                if high and high >= stop:
+                    return t_str_out, stop, "❌ 停損"
+                if low and low <= target:
+                    return t_str_out, target, "✅ 目標達到"
+            except Exception:
+                continue
+
+        return None, None, None
+    except Exception as e:
+        logger.error(f"find_exit_time {code}: {e}")
+        return None, None, None
+
 def format_daily_summary():
     """收盤日結算：計算今日所有盤中提醒假設進場的損益"""
     now = datetime.now(TW_TZ)
@@ -544,25 +609,40 @@ def format_daily_summary():
             day_low = close_price
             day_high_now = close_price
 
-        # 判斷出場：目標達到 > 停損觸發 > 收盤了結
-        if day_low <= target:
-            exit_price = target
-            result = "✅ 目標達到"
-        elif day_high_now >= stop:
-            exit_price = stop
-            result = "❌ 停損"
+        # 先嘗試用 Fugle 分鐘K找精確出場時間
+        exit_time_exact, exit_price_exact, result_exact = find_exit_time(
+            code, t["time"], target, stop)
+
+        if exit_time_exact and exit_price_exact and result_exact:
+            # Fugle 分鐘K找到精確時間
+            exit_price = exit_price_exact
+            result = result_exact
+            exit_time = exit_time_exact
         else:
-            exit_price = close_price
-            result = "⚪ 收盤了結"
+            # 備用：用日K高低點判斷，出場時間估算
+            if day_low <= target:
+                exit_price = target
+                result = "✅ 目標達到"
+                exit_time = "盤中"
+            elif day_high_now >= stop:
+                exit_price = stop
+                result = "❌ 停損"
+                exit_time = "盤中"
+            else:
+                exit_price = close_price
+                result = "⚪ 收盤了結"
+                exit_time = "13:25"
 
         gross, net = calc_pnl(entry, exit_price)
         total_gross += gross
         total_net += net
         pnl_str = f"+{net:,}" if net >= 0 else f"{net:,}"
 
+        icon = "✅" if net >= 0 else "❌"
         lines.append(
-            f"{'✅' if net >= 0 else '❌'} <b>{code} {t['name']}</b>（{t['time']}進場）\n"
-            f"  空單：{entry}元 → 出場：{exit_price}元 [{result}]\n"
+            f"{icon} <b>{code} {t['name']}</b>\n"
+            f"  進場：{t['time']} @ {entry}元 → 出場：{exit_time} @ {exit_price}元\n"
+            f"  結果：{result}\n"
             f"  每張損益：<b>{pnl_str}</b> 元（含手續費稅）"
         )
 
