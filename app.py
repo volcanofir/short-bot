@@ -28,10 +28,7 @@ TG_API = f"https://api.telegram.org/bot{TG_TOKEN}"
 _watchlist_today = []
 _alerted_today = set()
 _last_reset_date = None
-_today_trades = []  # 今日盤中提醒進場的交易記錄
-
-# ── 今日交易記錄（假設所有提醒都進場）──
-_today_trades = []  # {code, name, entry, stop, target, watch_line}
+_today_trades = []  # 今日盤中提醒進場的交易記錄 {code, name, entry, stop, target, watch_line}
 
 STOCK_NAMES = {
     "2330": "台積電", "2317": "鴻海", "2454": "聯發科", "2382": "廣達",
@@ -317,7 +314,7 @@ def fetch_all():
                         continue
                     pct = chg / prev * 100
                     market = "上市" if symbol.endswith(".TW") else "上櫃"
-                    if 3.0 <= pct <= 9.5 and vol >= 500:
+                    if 3.0 <= pct <= 7.0 and vol >= 500:
                         trade = calc_trade(close)
                         results.append({
                             "market": market, "code": code, "name": name,
@@ -333,7 +330,7 @@ def fetch_all():
     if not results:
         for symbol in SYMBOLS[:100]:
             data = fetch_stock_history(symbol)
-            if data and 3.0 <= data["pct"] <= 9.5 and data["vol"] >= 500 and data["close"] <= 1000:
+            if data and 3.0 <= data["pct"] <= 7.0 and data["vol"] >= 500 and data["close"] <= 1000:
                 code = symbol.replace(".TW", "").replace(".TWO", "")
                 market = "上市" if symbol.endswith(".TW") else "上櫃"
                 name = STOCK_NAMES.get(code, code)
@@ -371,9 +368,35 @@ def reset_daily_state():
     today = datetime.now(TW_TZ).date()
     if _last_reset_date != today:
         _alerted_today = set()
-        _today_trades = []
+        _today_trades.clear()
         _last_reset_date = today
         logger.info(f"Daily reset for {today}")
+
+
+def get_prev_day_high(code):
+    """取得昨日最高價（用於判斷是否突破前高）"""
+    symbol = f"{code}.TW"
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    params = {"interval": "1d", "range": "5d", "includePrePost": "false"}
+    try:
+        r = requests.get(url, params=params, headers={"User-Agent": UA}, timeout=8)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        result = data.get("chart", {}).get("result", [])
+        if not result:
+            return None
+        chart = result[0]
+        q = chart.get("indicators", {}).get("quote", [{}])[0]
+        highs = q.get("high", [])
+        valid_highs = [h for h in highs if h is not None]
+        if len(valid_highs) < 2:
+            return None
+        # 倒數第二根日K的高點 = 昨日高點
+        return round(valid_highs[-2], 2)
+    except Exception as e:
+        logger.error(f"get_prev_day_high {code}: {e}")
+        return None
 
 
 def intraday_monitor():
@@ -411,14 +434,27 @@ def intraday_monitor():
         day_high = quote["day_high"] or current
         watch_line = stock["watch_line"]
 
-        # 進場條件：漲幅在 0.5%~2.5% 之間，還沒過觀察空點
+        # 基本進場條件：漲幅在 0.5%~2.5% 之間，還沒過觀察空點
         if not (0.5 <= pct_now < 2.5 and current < watch_line):
+            continue
+
+        # 大叔策略：量縮確認（盤中成交量低於昨日總量的 2%）
+        est_vol_threshold = stock.get("est_vol", 0)
+        if est_vol_threshold > 0 and quote["vol"] > est_vol_threshold * 3:
+            # 盤中量是累積的，用3倍試撮門檻當參考（避免太早篩掉）
+            logger.info(f"{code} 盤中量{quote['vol']} > 門檻{est_vol_threshold*3}，量未縮，跳過")
+            continue
+
+        # 大叔策略：今日高點已突破昨日高點 → 不空，放棄
+        prev_high = get_prev_day_high(code)
+        if prev_high and day_high >= prev_high:
+            logger.info(f"{code} 今日高{day_high} >= 昨日高{prev_high}，跳過不空")
             continue
 
         _alerted_today.add(code)
 
-        # 以當日實際高點為停損基準（大叔策略）
-        stop_actual = round(day_high * 1.005, 1)
+        # 以當日實際高點為停損基準（大叔策略：過前高即停損）
+        stop_actual = round(day_high + 0.1, 1)  # 過今日高點一檔
         risk = stop_actual - current
         target_actual = round(current - risk * 2, 1)
         stop_pct = round(risk / current * 100, 2)
@@ -438,11 +474,12 @@ def intraday_monitor():
         })
 
         now_str = now.strftime("%H:%M")
+        prev_high_str = f"{prev_high}" if prev_high else "無資料"
         alert = (
             f"🚨 <b>盤中進場提醒 {now_str}</b>\n\n"
             f"{stock['signal']} <b>{code} {stock['name']}</b> [{stock['market']}]\n"
             f"  📍 現價：<b>{current}</b> 元（+{pct_now:.2f}%）\n"
-            f"  📊 今日高點：<b>{day_high}</b> 元\n"
+            f"  📊 今日高點：<b>{day_high}</b> 元 ✅（未突破昨高 {prev_high_str} 元）\n"
             f"  昨收：{stock['close']} 元（昨漲 +{stock['pct']}%）\n\n"
             f"  ━━━━━━ 進場建議 ━━━━━━\n"
             f"  🎯 掛空區間：<b>{entry_low}~{entry_high}</b> 元（試算以 {entry_mid} 元計）\n"
@@ -577,7 +614,7 @@ def backtest_symbol(symbol, period_days):
             if prev_close <= 0 or today["close"] <= 0:
                 continue
             pct = (today["close"] - prev_close) / prev_close * 100
-            if not (3.0 <= pct <= 9.5 and today["vol"] >= 500 and today["close"] <= 1000):
+            if not (3.0 <= pct <= 7.0 and today["vol"] >= 500 and today["close"] <= 1000):
                 continue
             watch_line = round(today["close"] * 1.025, 1)
             stop_price = round(today["close"] * 1.020, 1)
@@ -688,9 +725,10 @@ def format_report(candidates):
     lines.append(
         f"\n⚠️ <b>{next_str} 進場前需確認：</b>\n"
         "① 試撮量縮（低於上方門檻）\n"
-        "② 漲不過觀察空點\n"
-        "③ 趨勢線形成後再空\n"
-        "④ 全程當沖，收盤前了結\n\n"
+        "② 漲不過觀察空點（+2.5%）\n"
+        "③ 盤中量縮（低於試撮門檻）\n"
+        "④ 趨勢線轉折後再空\n"
+        "⑤ 全程當沖，收盤前了結\n\n"
         "🔔 開盤後每5分鐘盤中監控，符合條件 Telegram 即時提醒"
     )
     return "\n".join(lines)
