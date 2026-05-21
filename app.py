@@ -28,6 +28,10 @@ TG_API = f"https://api.telegram.org/bot{TG_TOKEN}"
 _watchlist_today = []
 _alerted_today = set()
 _last_reset_date = None
+_today_trades = []  # 今日盤中提醒進場的交易記錄
+
+# ── 今日交易記錄（假設所有提醒都進場）──
+_today_trades = []  # {code, name, entry, stop, target, watch_line}
 
 STOCK_NAMES = {
     "2330": "台積電", "2317": "鴻海", "2454": "聯發科", "2382": "廣達",
@@ -363,10 +367,11 @@ def screen():
 # ──────────────────────────────────────────────
 
 def reset_daily_state():
-    global _alerted_today, _last_reset_date
+    global _alerted_today, _last_reset_date, _today_trades
     today = datetime.now(TW_TZ).date()
     if _last_reset_date != today:
         _alerted_today = set()
+        _today_trades = []
         _last_reset_date = today
         logger.info(f"Daily reset for {today}")
 
@@ -413,7 +418,7 @@ def intraday_monitor():
         _alerted_today.add(code)
 
         # 以當日實際高點為停損基準（大叔策略）
-        stop_actual = round(day_high * 1.005, 1)  # 過當日高點一點點
+        stop_actual = round(day_high * 1.005, 1)
         risk = stop_actual - current
         target_actual = round(current - risk * 2, 1)
         stop_pct = round(risk / current * 100, 2)
@@ -422,6 +427,15 @@ def intraday_monitor():
         # 建議掛空區間：現價到觀察空點之間
         entry_low = round(current * 1.005, 1)
         entry_high = round(watch_line - 0.1, 1)
+        entry_mid = round((entry_low + entry_high) / 2, 1)
+
+        # 記錄交易（供收盤結算用）
+        _today_trades.append({
+            "code": code, "name": stock["name"],
+            "entry": entry_mid, "stop": stop_actual,
+            "target": target_actual, "watch_line": watch_line,
+            "time": now.strftime("%H:%M"),
+        })
 
         now_str = now.strftime("%H:%M")
         alert = (
@@ -431,8 +445,8 @@ def intraday_monitor():
             f"  📊 今日高點：<b>{day_high}</b> 元\n"
             f"  昨收：{stock['close']} 元（昨漲 +{stock['pct']}%）\n\n"
             f"  ━━━━━━ 進場建議 ━━━━━━\n"
-            f"  🎯 掛空區間：<b>{entry_low}~{entry_high}</b> 元\n"
-            f"     （等小拉升時掛高空，漲不過 {watch_line} 才空）\n\n"
+            f"  🎯 掛空區間：<b>{entry_low}~{entry_high}</b> 元（試算以 {entry_mid} 元計）\n"
+            f"     （等小拉升掛高空，漲不過 {watch_line} 才空）\n\n"
             f"  🛑 停損：過今日高點 <b>{stop_actual}</b> 元（+{stop_pct}%）\n"
             f"  💰 目標：<b>{target_actual}</b> 元（-{target_pct}%，賺賠比 2:1）\n\n"
             f"  ⚠️ 確認試撮量縮 + 趨勢線後再掛單\n"
@@ -449,6 +463,82 @@ def intraday_monitor():
 # ──────────────────────────────────────────────
 # 回測
 # ──────────────────────────────────────────────
+
+
+def calc_pnl(entry, exit_price, lots=1):
+    """計算當沖做空損益（單張）含手續費與稅"""
+    gross = (entry - exit_price) * 1000 * lots
+    fee = (entry + exit_price) * 1000 * lots * 0.001425  # 買賣手續費
+    tax = exit_price * 1000 * lots * 0.0015              # 證交稅（當沖減半）
+    net = gross - fee - tax
+    return round(gross), round(net)
+
+
+def format_daily_summary():
+    """收盤日結算：計算今日所有盤中提醒假設進場的損益"""
+    now = datetime.now(TW_TZ)
+    date_str = now.strftime("%m/%d")
+
+    if not _today_trades:
+        return f"📋 <b>{date_str} 今日收盤結算</b>\n\n今日無盤中提醒進場記錄"
+
+    lines = [f"📋 <b>{date_str} 今日收盤結算（試算）</b>",
+             f"共 {len(_today_trades)} 筆進場\n"]
+
+    total_gross = 0
+    total_net = 0
+
+    for t in _today_trades:
+        code = t["code"]
+        entry = t["entry"]
+        target = t["target"]
+        stop = t["stop"]
+
+        # 取收盤價
+        q = fugle_quote(code)
+        if q:
+            close_price = q["current"]
+            day_low = q.get("day_low") or close_price
+            day_high_now = q.get("day_high") or close_price
+        else:
+            # Fugle 收盤後可能無資料，用 Yahoo 備用
+            hist = fetch_stock_history(f"{code}.TW")
+            close_price = hist["close"] if hist else entry
+            day_low = close_price
+            day_high_now = close_price
+
+        # 判斷出場：目標達到 > 停損觸發 > 收盤了結
+        if day_low <= target:
+            exit_price = target
+            result = "✅ 目標達到"
+        elif day_high_now >= stop:
+            exit_price = stop
+            result = "❌ 停損"
+        else:
+            exit_price = close_price
+            result = "⚪ 收盤了結"
+
+        gross, net = calc_pnl(entry, exit_price)
+        total_gross += gross
+        total_net += net
+        pnl_str = f"+{net:,}" if net >= 0 else f"{net:,}"
+
+        lines.append(
+            f"{'✅' if net >= 0 else '❌'} <b>{code} {t['name']}</b>（{t['time']}進場）\n"
+            f"  空單：{entry}元 → 出場：{exit_price}元 [{result}]\n"
+            f"  每張損益：<b>{pnl_str}</b> 元（含手續費稅）"
+        )
+
+    total_str = f"+{total_net:,}" if total_net >= 0 else f"{total_net:,}"
+    gross_str = f"+{total_gross:,}" if total_gross >= 0 else f"{total_gross:,}"
+    lines.append(
+        f"\n━━━━━━━━━━━━\n"
+        f"📊 <b>今日合計</b>\n"
+        f"  毛利：{gross_str} 元\n"
+        f"  淨損益（含費稅）：<b>{total_str}</b> 元\n"
+        f"\n⚠️ 以試算進場價（區間中間值）計算，僅供參考"
+    )
+    return "\n".join(lines)
 
 def backtest_symbol(symbol, period_days):
     range_map = {7: "1mo", 15: "1mo", 30: "3mo"}
@@ -728,13 +818,17 @@ def format_test():
 # ──────────────────────────────────────────────
 
 def job_evening_push():
-    """13:40 收盤後推播到 Telegram（完整版）"""
+    """13:40 收盤後推播到 Telegram（完整版 + 今日結算）"""
     now = datetime.now(TW_TZ)
     if now.weekday() >= 5:
         return
     logger.info("Evening push")
+    # 先推播收盤篩選（明日觀察名單）
     candidates = screen()
     tg_only(CHAT_ID, format_report(candidates))
+    # 等5秒再推播今日結算
+    time.sleep(5)
+    tg_only(CHAT_ID, format_daily_summary())
 
 
 def job_morning_line():
