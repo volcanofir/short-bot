@@ -832,19 +832,29 @@ def job_evening_push():
 
 
 def job_morning_line():
-    """08:50 早上推播到 LINE（簡潔版，開盤前提醒）"""
+    """08:50 早上推播到 LINE（簡潔版，開盤前提醒）
+    優先使用前一天 13:40 存好的觀察名單
+    若無（例如伺服器重啟）則重新抓昨日收盤資料
+    """
     now = datetime.now(TW_TZ)
     if now.weekday() >= 5:
         return
     logger.info("Morning LINE push")
     if _watchlist_today:
-        # 用昨天存的名單
+        # 使用前一天 13:40 已存好的名單（最準確）
+        logger.info(f"Morning push using cached watchlist: {len(_watchlist_today)} stocks")
         line_send(format_line_morning(_watchlist_today))
     else:
-        # 如果名單是空的就重新抓
+        # 伺服器重啟後名單遺失，重新抓昨日資料
+        logger.info("Morning push: no cached watchlist, fetching fresh data")
         candidates = screen()
         if candidates:
+            # 更新快取
+            global _watchlist_today
+            _watchlist_today = [{**c, "est_vol": max(1, int(c["vol"] * 0.02))} for c in candidates]
             line_send(format_line_morning(candidates))
+        else:
+            line_send("📊 今日無做空觀察標的")
 
 
 scheduler = BackgroundScheduler(timezone=TW_TZ)
