@@ -18,10 +18,16 @@ TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 LINE_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_USER_ID = os.environ.get("LINE_USER_ID", "")
+FUGLE_TOKEN = os.environ.get("FUGLE_API_TOKEN", "")
 
 TW_TZ = pytz.timezone("Asia/Taipei")
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 TG_API = f"https://api.telegram.org/bot{TG_TOKEN}"
+
+# ── 盤中監控狀態 ──
+_watchlist_today = []
+_alerted_today = set()
+_last_reset_date = None
 
 STOCK_NAMES = {
     "2330": "台積電", "2317": "鴻海", "2454": "聯發科", "2382": "廣達",
@@ -105,6 +111,7 @@ def tg_send(chat_id, text, parse_mode="HTML"):
 
 
 def line_send(text):
+    """發送純文字到 LINE"""
     if not LINE_TOKEN or not LINE_USER_ID:
         return
     try:
@@ -112,10 +119,8 @@ def line_send(text):
         clean = re.sub(r'\n{3,}', '\n\n', clean).strip()
         requests.post(
             "https://api.line.me/v2/bot/message/push",
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {LINE_TOKEN}"
-            },
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {LINE_TOKEN}"},
             json={"to": LINE_USER_ID, "messages": [{"type": "text", "text": clean}]},
             timeout=10
         )
@@ -124,9 +129,16 @@ def line_send(text):
         logger.error(f"LINE send error: {e}")
 
 
-def broadcast(tg_chat_id, text):
-    if tg_chat_id:
-        tg_send(tg_chat_id, text)
+def tg_only(chat_id, text):
+    """只發 Telegram"""
+    if chat_id:
+        tg_send(chat_id, text)
+
+
+def broadcast(chat_id, text):
+    """同時發 Telegram + LINE"""
+    if chat_id:
+        tg_send(chat_id, text)
     line_send(text)
 
 
@@ -135,7 +147,6 @@ def broadcast(tg_chat_id, text):
 # ──────────────────────────────────────────────
 
 def get_last_trading_day():
-    """取得最近收盤的交易日"""
     now = datetime.now(TW_TZ)
     d = now.date()
     if now.hour < 13 or (now.hour == 13 and now.minute < 30):
@@ -146,16 +157,11 @@ def get_last_trading_day():
 
 
 def get_next_trading_day(d):
-    """取得下一個交易日"""
     next_d = d + timedelta(days=1)
     while next_d.weekday() >= 5:
         next_d += timedelta(days=1)
     return next_d
 
-
-# ──────────────────────────────────────────────
-# 策略計算
-# ──────────────────────────────────────────────
 
 def calc_trade(close):
     watch_line = round(close * 1.025, 1)
@@ -176,7 +182,41 @@ def get_signal(pct, vol):
 
 
 # ──────────────────────────────────────────────
-# 資料抓取
+# Fugle 即時報價
+# ──────────────────────────────────────────────
+
+def fugle_quote(code):
+    if not FUGLE_TOKEN:
+        return None
+    try:
+        url = f"https://api.fugle.tw/marketdata/v1.0/stock/intraday/quote/{code}"
+        r = requests.get(url, headers={"X-API-KEY": FUGLE_TOKEN}, timeout=8)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        current = data.get("lastPrice") or data.get("closePrice")
+        prev_close = data.get("previousClose") or data.get("referencePrice")
+        day_high = data.get("highPrice")
+        day_low = data.get("lowPrice")
+        volume = data.get("totalVolume", 0)
+        if not current or not prev_close or prev_close <= 0:
+            return None
+        pct = (current - prev_close) / prev_close * 100
+        return {
+            "current": round(current, 2),
+            "prev_close": round(prev_close, 2),
+            "pct": round(pct, 2),
+            "vol": int(volume) // 1000,
+            "day_high": round(day_high, 2) if day_high else None,
+            "day_low": round(day_low, 2) if day_low else None,
+        }
+    except Exception as e:
+        logger.error(f"Fugle quote error {code}: {e}")
+        return None
+
+
+# ──────────────────────────────────────────────
+# 資料抓取（Yahoo 收盤後）
 # ──────────────────────────────────────────────
 
 def fetch_stock_history(symbol, days=5):
@@ -211,12 +251,11 @@ def fetch_stock_history(symbol, days=5):
         return None
 
 
-def fetch_intraday(symbol, target_date):
+def fetch_intraday_yahoo(symbol, target_date):
     now = datetime.now(TW_TZ)
     days_ago = (now.date() - target_date).days
     interval = "1m" if days_ago <= 6 else "1h"
     range_str = "7d" if days_ago <= 6 else "1mo"
-
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
     params = {"interval": interval, "range": range_str, "includePrePost": "false"}
     try:
@@ -232,7 +271,6 @@ def fetch_intraday(symbol, target_date):
         highs = q.get("high", [])
         lows = q.get("low", [])
         timestamps = chart.get("timestamp", [])
-
         open_highs, open_lows = [], []
         for ts, h, l in zip(timestamps, highs, lows):
             if h is None or l is None:
@@ -245,7 +283,6 @@ def fetch_intraday(symbol, target_date):
             if open_t <= dt <= close_t:
                 open_highs.append(h)
                 open_lows.append(l)
-
         if not open_highs:
             return None
         return {"max_high": max(open_highs), "min_low": min(open_lows), "interval": interval}
@@ -257,7 +294,6 @@ def fetch_intraday(symbol, target_date):
 def fetch_all():
     results = []
     headers = {"User-Agent": UA, "Accept": "application/json"}
-
     for i in range(0, len(SYMBOLS), 40):
         batch = SYMBOLS[i:i+40]
         url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={','.join(batch)}"
@@ -323,6 +359,94 @@ def screen():
 
 
 # ──────────────────────────────────────────────
+# 盤中監控（Fugle 即時，含進場建議）
+# ──────────────────────────────────────────────
+
+def reset_daily_state():
+    global _alerted_today, _last_reset_date
+    today = datetime.now(TW_TZ).date()
+    if _last_reset_date != today:
+        _alerted_today = set()
+        _last_reset_date = today
+        logger.info(f"Daily reset for {today}")
+
+
+def intraday_monitor():
+    """
+    盤中監控：每5分鐘掃描觀察名單
+    用 Fugle 取得即時報價 + 當日高點
+    符合條件時推播進場建議（只發 Telegram，不發 LINE）
+    """
+    global _alerted_today
+    now = datetime.now(TW_TZ)
+
+    if now.weekday() >= 5:
+        return
+    if not (9 <= now.hour < 13 or (now.hour == 13 and now.minute <= 30)):
+        return
+
+    reset_daily_state()
+
+    if not _watchlist_today:
+        return
+
+    logger.info(f"Intraday monitor: {len(_watchlist_today)} stocks")
+
+    for stock in _watchlist_today:
+        code = stock["code"]
+        if code in _alerted_today:
+            continue
+
+        quote = fugle_quote(code)
+        if not quote:
+            continue
+
+        current = quote["current"]
+        pct_now = quote["pct"]
+        day_high = quote["day_high"] or current
+        watch_line = stock["watch_line"]
+
+        # 進場條件：漲幅在 0.5%~2.5% 之間，還沒過觀察空點
+        if not (0.5 <= pct_now < 2.5 and current < watch_line):
+            continue
+
+        _alerted_today.add(code)
+
+        # 以當日實際高點為停損基準（大叔策略）
+        stop_actual = round(day_high * 1.005, 1)  # 過當日高點一點點
+        risk = stop_actual - current
+        target_actual = round(current - risk * 2, 1)
+        stop_pct = round(risk / current * 100, 2)
+        target_pct = round(risk * 2 / current * 100, 2)
+
+        # 建議掛空區間：現價到觀察空點之間
+        entry_low = round(current * 1.005, 1)
+        entry_high = round(watch_line - 0.1, 1)
+
+        now_str = now.strftime("%H:%M")
+        alert = (
+            f"🚨 <b>盤中進場提醒 {now_str}</b>\n\n"
+            f"{stock['signal']} <b>{code} {stock['name']}</b> [{stock['market']}]\n"
+            f"  📍 現價：<b>{current}</b> 元（+{pct_now:.2f}%）\n"
+            f"  📊 今日高點：<b>{day_high}</b> 元\n"
+            f"  昨收：{stock['close']} 元（昨漲 +{stock['pct']}%）\n\n"
+            f"  ━━━━━━ 進場建議 ━━━━━━\n"
+            f"  🎯 掛空區間：<b>{entry_low}~{entry_high}</b> 元\n"
+            f"     （等小拉升時掛高空，漲不過 {watch_line} 才空）\n\n"
+            f"  🛑 停損：過今日高點 <b>{stop_actual}</b> 元（+{stop_pct}%）\n"
+            f"  💰 目標：<b>{target_actual}</b> 元（-{target_pct}%，賺賠比 2:1）\n\n"
+            f"  ⚠️ 確認試撮量縮 + 趨勢線後再掛單\n"
+            f"  ⚠️ 全程當沖，收盤前了結"
+        )
+
+        # 盤中提醒只發 Telegram，不打擾 LINE
+        tg_only(CHAT_ID, alert)
+        logger.info(f"Intraday alert: {code}")
+
+        time.sleep(0.3)
+
+
+# ──────────────────────────────────────────────
 # 回測
 # ──────────────────────────────────────────────
 
@@ -344,7 +468,6 @@ def backtest_symbol(symbol, period_days):
         closes = q.get("close", [])
         volumes = q.get("volume", [])
         timestamps = chart.get("timestamp", [])
-
         valid = []
         for t, c, v in zip(timestamps, closes, volumes):
             if c is not None and v is not None:
@@ -352,34 +475,26 @@ def backtest_symbol(symbol, period_days):
                     "date": datetime.fromtimestamp(t, TW_TZ).date(),
                     "close": c, "vol": int(v) // 1000
                 })
-
         if len(valid) < 3:
             return []
-
         cutoff = (datetime.now(TW_TZ) - timedelta(days=period_days)).date()
         valid = [x for x in valid if x["date"] >= cutoff]
-
         trades = []
         for i in range(1, len(valid) - 1):
             today = valid[i]
             next_day = valid[i+1]
             prev_close = valid[i-1]["close"]
-
             if prev_close <= 0 or today["close"] <= 0:
                 continue
-
             pct = (today["close"] - prev_close) / prev_close * 100
             if not (3.0 <= pct <= 9.5 and today["vol"] >= 500 and today["close"] <= 1000):
                 continue
-
             watch_line = round(today["close"] * 1.025, 1)
             stop_price = round(today["close"] * 1.020, 1)
             risk = stop_price - today["close"]
             target_price = round(today["close"] - risk * 2, 1)
-
-            intraday = fetch_intraday(symbol, next_day["date"])
+            intraday = fetch_intraday_yahoo(symbol, next_day["date"])
             time.sleep(0.1)
-
             if not intraday:
                 profit = round((today["close"] - next_day["close"]) / today["close"] * 100, 2)
                 trades.append({
@@ -394,9 +509,8 @@ def backtest_symbol(symbol, period_days):
                 h1_high = intraday["max_high"]
                 h1_low = intraday["min_low"]
                 ivl = intraday["interval"]
-
                 if h1_high >= watch_line:
-                    continue  # 不進場不計入
+                    continue
                 elif h1_high >= stop_price:
                     profit = round(-(stop_price - today["close"]) / today["close"] * 100, 2)
                     result_type = f"停損（{ivl}）"
@@ -410,7 +524,6 @@ def backtest_symbol(symbol, period_days):
                     result_type = "收盤了結"
                     win = profit > 0
                     hit = False
-
                 trades.append({
                     "date": today["date"].strftime("%m/%d"),
                     "next_date": next_day["date"].strftime("%m/%d"),
@@ -419,7 +532,6 @@ def backtest_symbol(symbol, period_days):
                     "profit": profit, "result": result_type,
                     "win": win, "hit_in_hour": hit
                 })
-
         return trades
     except Exception as e:
         logger.error(f"Backtest {symbol}: {e}")
@@ -454,6 +566,8 @@ def run_backtest(period_days):
 # ──────────────────────────────────────────────
 
 def format_report(candidates):
+    """完整報告（Telegram 用，含 HTML）"""
+    global _watchlist_today
     last_day = get_last_trading_day()
     next_day = get_next_trading_day(last_day)
     last_str = last_day.strftime("%m/%d")
@@ -466,6 +580,8 @@ def format_report(candidates):
             "（量能不足、漲幅不符或股價超過千元）"
         )
 
+    _watchlist_today = [{**c, "est_vol": max(1, int(c["vol"] * 0.02))} for c in candidates]
+
     lines = [f"📊 <b>{last_str} 收盤篩選｜{next_str} 觀察名單（{len(candidates)} 支）</b>\n"]
     for c in candidates:
         est_vol = max(1, int(c["vol"] * 0.02))
@@ -474,8 +590,8 @@ def format_report(candidates):
             f"  {last_str}收：<b>{c['close']}</b>元  漲幅：<b>+{c['pct']}%</b>  量：<b>{c['vol']:,}</b>張\n"
             f"  ━━━━━━━━━━━━\n"
             f"  👁 {next_str} 觀察空點：漲不過 <b>{c['watch_line']}</b> 元（+2.5%）才考慮空\n"
-            f"  🛑 停損參考：<b>{c['stop_ref']}</b> 元（+{c['stop_pct']}%，實際以早盤高點為準）\n"
-            f"  💰 目標參考：<b>{c['target_ref']}</b> 元（-{c['target_pct']}%，賺賠比 2:1）\n"
+            f"  🛑 停損參考：過早盤高點（參考 <b>{c['stop_ref']}</b> 元）\n"
+            f"  💰 目標參考：<b>{c['target_ref']}</b> 元（賺賠比 2:1）\n"
             f"  📌 試撮量需低於 {est_vol:,} 張"
         )
 
@@ -484,8 +600,34 @@ def format_report(candidates):
         "① 試撮量縮（低於上方門檻）\n"
         "② 漲不過觀察空點\n"
         "③ 趨勢線形成後再空\n"
-        "④ 全程當沖，收盤前了結"
+        "④ 全程當沖，收盤前了結\n\n"
+        "🔔 開盤後每5分鐘盤中監控，符合條件 Telegram 即時提醒"
     )
+    return "\n".join(lines)
+
+
+def format_line_morning(candidates):
+    """LINE 早上提醒格式（純文字，簡潔）"""
+    last_day = get_last_trading_day()
+    next_day = get_next_trading_day(last_day)
+    next_str = next_day.strftime("%m/%d")
+
+    if not candidates:
+        return f"📊 {next_str} 今日無做空觀察標的"
+
+    lines = [f"📊 {next_str} 做空觀察名單（開盤注意）\n"]
+    for c in candidates:
+        est_vol = max(1, int(c["vol"] * 0.02))
+        lines.append(
+            f"{'🔴' if '高度' in c['signal'] else '🟡'} {c['code']} {c['name']}\n"
+            f"  昨收 {c['close']}元 漲{c['pct']}%\n"
+            f"  空點：漲不過 {c['watch_line']} 元\n"
+            f"  停損：過早盤高點\n"
+            f"  目標：{c['target_ref']} 元\n"
+            f"  試撮量 < {est_vol:,} 張"
+        )
+
+    lines.append("\n記得確認試撮量縮+趨勢線才進場")
     return "\n".join(lines)
 
 
@@ -493,11 +635,9 @@ def format_backtest(period_days, symbol_results, all_trades):
     lines = [f"📈 <b>回測報告（近 {period_days} 天）</b>"]
     note = "1分K" if period_days <= 7 else "1小時K"
     lines.append(f"開盤1小時判斷：{note}\n")
-
     if not all_trades:
         lines.append("此期間無符合條件的進場機會")
         return "\n".join(lines)
-
     total = len(all_trades)
     wins = sum(1 for t in all_trades if t["win"])
     hour_wins = sum(1 for t in all_trades if t.get("hit_in_hour"))
@@ -508,7 +648,6 @@ def format_backtest(period_days, symbol_results, all_trades):
     l_list = [t["profit"] for t in all_trades if not t["win"]]
     avg_win = round(sum(p_list)/len(p_list), 2) if p_list else 0
     avg_loss = round(sum(l_list)/len(l_list), 2) if l_list else 0
-
     lines.append(
         f"📊 <b>整體統計</b>\n"
         f"  進場次數：{total} 次\n"
@@ -517,7 +656,6 @@ def format_backtest(period_days, symbol_results, all_trades):
         f"  平均獲利：<b>{avg_win:+.2f}%</b> | 平均虧損：<b>{avg_loss:+.2f}%</b>\n"
         f"  平均每筆：<b>{avg_profit:+.2f}%</b>\n"
     )
-
     good = [(c, r) for c, r in symbol_results.items() if r["total"] >= 2 and r["win_rate"] >= 50]
     good.sort(key=lambda x: (-x[1]["hour_win_rate"], -x[1]["avg_profit"]))
     if good:
@@ -528,7 +666,6 @@ def format_backtest(period_days, symbol_results, all_trades):
                 f"1小時{r['hour_win_rate']}%（{r['hour_wins']}/{r['total']}）"
                 f" 均{r['avg_profit']:+.2f}%"
             )
-
     recent = sorted(all_trades, key=lambda x: x["date"], reverse=True)[:4]
     lines.append("\n📅 <b>最近進場記錄：</b>")
     for t in recent:
@@ -539,7 +676,6 @@ def format_backtest(period_days, symbol_results, all_trades):
             f"     空點{t['watch_line']} 停損{t['stop']} 目標{t['target']}\n"
             f"     {t['next_date']} → {t['result']}{hour_tag} {t['profit']:+.2f}%"
         )
-
     lines.append("\n⚠️ 回測為理想當沖條件，實際須配合試撮量縮+趨勢確認")
     return "\n".join(lines)
 
@@ -552,7 +688,6 @@ def format_test():
         f"🔧 <b>系統測試 {now}</b>",
         f"收盤日：{last_day.strftime('%m/%d')} → 觀察日：{next_day.strftime('%m/%d')}\n"
     ]
-
     try:
         url = "https://query1.finance.yahoo.com/v7/finance/quote?symbols=2330.TW,2615.TW"
         r = requests.get(url, headers={"User-Agent": UA}, timeout=8)
@@ -562,17 +697,21 @@ def format_test():
             q = quotes[0]
             lines.append(f"   台積電：{q.get('regularMarketPrice')}元 ({round(q.get('regularMarketChangePercent',0),2):+.2f}%)")
     except Exception as e:
-        lines.append(f"❌ v7 失敗：{str(e)[:40]}")
+        lines.append(f"❌ Yahoo v7：{str(e)[:40]}")
 
-    try:
-        data = fetch_stock_history("2615.TW")
-        if data:
-            lines.append(f"✅ Yahoo v8 日K：正常")
-            lines.append(f"   萬海：{data['close']}元 ({data['pct']:+.2f}%) {data['vol']:,}張")
-    except Exception as e:
-        lines.append(f"❌ v8 失敗：{str(e)[:40]}")
+    if FUGLE_TOKEN:
+        q = fugle_quote("2330")
+        if q:
+            lines.append(f"✅ Fugle 即時：正常")
+            lines.append(f"   台積電：{q['current']}元 ({q['pct']:+.2f}%) 高{q['day_high']}")
+        else:
+            lines.append("⚠️ Fugle：無資料（非交易時段正常）")
+    else:
+        lines.append("❌ Fugle：未設定 Token")
 
-    lines.append(f"LINE 推播：{'✅ 已設定' if LINE_TOKEN and LINE_USER_ID else '❌ 未設定'}")
+    lines.append(f"LINE 推播：{'✅' if LINE_TOKEN and LINE_USER_ID else '❌ 未設定'}")
+    lines.append(f"盤中監控名單：{len(_watchlist_today)} 支")
+    lines.append(f"今日已提醒：{len(_alerted_today)} 支")
 
     candidates = screen()
     lines.append(f"\n📊 篩選結果：{len(candidates)} 支")
@@ -588,16 +727,41 @@ def format_test():
 # 排程
 # ──────────────────────────────────────────────
 
-def push_report():
+def job_evening_push():
+    """13:40 收盤後推播到 Telegram（完整版）"""
     now = datetime.now(TW_TZ)
     if now.weekday() >= 5:
         return
-    logger.info(f"Auto push at {now}")
-    broadcast(CHAT_ID, format_report(screen()))
+    logger.info("Evening push")
+    candidates = screen()
+    tg_only(CHAT_ID, format_report(candidates))
+
+
+def job_morning_line():
+    """08:50 早上推播到 LINE（簡潔版，開盤前提醒）"""
+    now = datetime.now(TW_TZ)
+    if now.weekday() >= 5:
+        return
+    logger.info("Morning LINE push")
+    if _watchlist_today:
+        # 用昨天存的名單
+        line_send(format_line_morning(_watchlist_today))
+    else:
+        # 如果名單是空的就重新抓
+        candidates = screen()
+        if candidates:
+            line_send(format_line_morning(candidates))
 
 
 scheduler = BackgroundScheduler(timezone=TW_TZ)
-scheduler.add_job(push_report, "cron", day_of_week="mon-fri", hour=13, minute=40)
+# 13:40 收盤推播（Telegram）
+scheduler.add_job(job_evening_push, "cron", day_of_week="mon-fri", hour=13, minute=40)
+# 08:50 早上提醒（LINE）
+scheduler.add_job(job_morning_line, "cron", day_of_week="mon-fri", hour=8, minute=50)
+# 盤中監控 09:00~13:30 每5分鐘（Telegram）
+scheduler.add_job(intraday_monitor, "cron",
+                  day_of_week="mon-fri",
+                  hour="9-13", minute="0,5,10,15,20,25,30,35,40,45,50,55")
 scheduler.start()
 
 
@@ -623,26 +787,27 @@ def handle_update(update):
 
     if text in ["/start", "/scan", "掃描", "篩選", "今天", "標的", "做空"]:
         tg_send(chat_id, "⏳ 篩選中，請稍候 15~25 秒...")
-        broadcast(chat_id, format_report(screen()))
+        candidates = screen()
+        tg_only(chat_id, format_report(candidates))
 
     elif text in ["/test", "測試"]:
         tg_send(chat_id, "🔧 測試中，請稍候...")
-        broadcast(chat_id, format_test())
+        tg_only(chat_id, format_test())
 
     elif text in ["/bt7", "回測7"]:
         tg_send(chat_id, "📈 回測近7天（1分K），請稍候約45秒...")
         results, trades = run_backtest(7)
-        broadcast(chat_id, format_backtest(7, results, trades))
+        tg_only(chat_id, format_backtest(7, results, trades))
 
     elif text in ["/bt15", "回測15"]:
         tg_send(chat_id, "📈 回測近15天（1小時K），請稍候約60秒...")
         results, trades = run_backtest(15)
-        broadcast(chat_id, format_backtest(15, results, trades))
+        tg_only(chat_id, format_backtest(15, results, trades))
 
     elif text in ["/bt30", "回測30"]:
         tg_send(chat_id, "📈 回測近30天（1小時K），請稍候約90秒...")
         results, trades = run_backtest(30)
-        broadcast(chat_id, format_backtest(30, results, trades))
+        tg_only(chat_id, format_backtest(30, results, trades))
 
     elif text == "/id":
         tg_send(chat_id, f"你的 Chat ID：\n<code>{chat_id}</code>")
@@ -650,15 +815,17 @@ def handle_update(update):
     elif text in ["/help", "說明"]:
         tg_send(chat_id, (
             "📋 <b>指令說明</b>\n\n"
-            "/scan — 篩選做空標的（同步推播至 LINE）\n"
+            "/scan — 篩選做空標的\n"
             "/bt7 — 回測近7天（1分K）\n"
             "/bt15 — 回測近15天（1小時K）\n"
             "/bt30 — 回測近30天（1小時K）\n"
             "/test — 系統測試\n"
             "/id — 查詢 Chat ID\n\n"
-            "⏰ 每日 13:40 自動推播至 Telegram + LINE\n"
-            "📊 篩選：漲幅 3~9.5% + 量能 + 股價 ≤1000元\n"
-            "🕙 回測：確認開盤1小時內是否達標"
+            "📅 推播時程：\n"
+            "  08:50 LINE 早上觀察名單提醒\n"
+            "  09:00~13:30 Telegram 盤中即時提醒\n"
+            "  13:40 Telegram 收盤完整推播\n\n"
+            "📊 篩選：漲幅 3~9.5% + 量能 + 股價 ≤1000元"
         ))
     else:
         tg_send(chat_id, "傳 /scan 篩選，/bt30 回測，/help 查看指令。")
@@ -685,7 +852,7 @@ threading.Thread(target=polling_loop, daemon=True).start()
 
 @app.route("/")
 def index():
-    return "📈 短空機器人（Telegram + LINE 雙推播）運行中"
+    return "📈 短空機器人運行中（TG + LINE + Fugle）"
 
 
 @app.route("/health")
