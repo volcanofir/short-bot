@@ -420,9 +420,8 @@ def intraday_monitor():
         logger.info("Intraday monitor: watchlist empty, auto-fetching...")
         candidates = screen()
         if candidates:
-            global _watchlist_today
-            _watchlist_today = [{**c, "est_vol": max(1, int(c["vol"] * 0.02))}
-                                for c in candidates]
+            _watchlist_today[:] = [{**c, "est_vol": max(1, int(c["vol"] * 0.02))}
+                                   for c in candidates]
             logger.info(f"Auto-loaded {len(_watchlist_today)} stocks into watchlist")
         else:
             logger.info("Intraday monitor: no candidates found")
@@ -966,17 +965,14 @@ def job_morning_line():
     優先使用前一天 13:40 存好的觀察名單
     若無（例如伺服器重啟）則重新抓昨日收盤資料
     """
-    global _watchlist_today
     now = datetime.now(TW_TZ)
     if now.weekday() >= 5:
         return
     logger.info("Morning LINE push")
     if _watchlist_today:
-        # 使用前一天 13:40 已存好的名單（最準確）
         logger.info(f"Morning push using cached watchlist: {len(_watchlist_today)} stocks")
         line_send(format_line_morning(_watchlist_today))
     else:
-        # 伺服器重啟後名單遺失，重新抓昨日資料
         logger.info("Morning push: no cached watchlist, fetching fresh data")
         candidates = screen()
         if candidates:
