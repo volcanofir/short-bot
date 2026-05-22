@@ -487,7 +487,7 @@ def intraday_monitor():
             f"  🛑 停損：過今日高點 <b>{stop_actual}</b> 元（+{stop_pct}%）\n"
             f"  💰 目標：<b>{target_actual}</b> 元（-{target_pct}%，賺賠比 2:1）\n\n"
             f"  ⚠️ 確認試撮量縮 + 趨勢線後再掛單\n"
-            f"  ⚠️ 全程當沖，收盤前了結"
+            f"  ⚠️ 全程當沖，最晚 13:00 前平倉"
         )
 
         # 盤中提醒只發 Telegram，不打擾 LINE
@@ -555,8 +555,10 @@ def find_exit_time(code, entry_time_str, target, stop):
                     dt = datetime.strptime(
                         t_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=TW_TZ)
 
-                # 只看今天、進場時間之後的K棒
-                if dt.date() != today or dt < entry_dt:
+                # 只看今天、進場時間之後、13:00 之前的K棒
+                cutoff_dt = datetime.now(TW_TZ).replace(
+                    hour=13, minute=0, second=0, microsecond=0)
+                if dt.date() != today or dt < entry_dt or dt > cutoff_dt:
                     continue
 
                 high = c.get("high", 0)
@@ -808,7 +810,7 @@ def format_report(candidates):
         "② 漲不過觀察空點（+2.5%）\n"
         "③ 盤中量縮（低於試撮門檻）\n"
         "④ 趨勢線轉折後再空\n"
-        "⑤ 全程當沖，收盤前了結\n\n"
+        "⑤ 全程當沖，最晚 13:00 前平倉\n\n"
         "🔔 開盤後每5分鐘盤中監控，符合條件 Telegram 即時提醒"
     )
     return "\n".join(lines)
@@ -978,11 +980,58 @@ scheduler = BackgroundScheduler(timezone=TW_TZ)
 scheduler.add_job(job_evening_push, "cron", day_of_week="mon-fri", hour=13, minute=40)
 # 08:50 早上提醒（LINE）
 scheduler.add_job(job_morning_line, "cron", day_of_week="mon-fri", hour=8, minute=50)
-# 盤中監控 09:00~13:30 每5分鐘（Telegram）
-scheduler.add_job(intraday_monitor, "cron",
-                  day_of_week="mon-fri",
-                  hour="9-13", minute="0,5,10,15,20,25,30,35,40,45,50,55")
+# 盤中監控改由背景執行緒處理（支援30秒/1分鐘間隔）
 scheduler.start()
+
+
+# ──────────────────────────────────────────────
+# 盤中監控執行緒（09:00~09:15 每30秒，09:15~13:00 每1分鐘）
+# ──────────────────────────────────────────────
+
+def intraday_loop():
+    """
+    背景執行緒：持續執行盤中監控
+    09:00~09:15：每 30 秒掃描一次（開盤關鍵期）
+    09:15~13:00：每 1 分鐘掃描一次
+    13:00 後停止
+    """
+    logger.info("Intraday loop thread started")
+    while True:
+        try:
+            now = datetime.now(TW_TZ)
+
+            # 只在交易日執行
+            if now.weekday() < 5:
+                h, m = now.hour, now.minute
+
+                # 09:00~13:00 才執行
+                if (h == 9 and m >= 0) or (10 <= h < 13) or (h == 13 and m == 0):
+                    start_ts = time.time()
+                    intraday_monitor()
+                    elapsed = time.time() - start_ts
+
+                    # 09:00~09:15 每30秒，其他時間每60秒
+                    # 扣掉執行時間，確保間隔準確
+                    if h == 9 and m < 15:
+                        interval = 30
+                    else:
+                        interval = 60
+
+                    sleep_sec = max(1, interval - elapsed)
+                    logger.info(f"Intraday scan took {elapsed:.1f}s, sleeping {sleep_sec:.1f}s")
+                    time.sleep(sleep_sec)
+                else:
+                    # 非交易時間每5分鐘檢查一次
+                    time.sleep(300)
+            else:
+                time.sleep(300)
+
+        except Exception as e:
+            logger.error(f"Intraday loop error: {e}")
+            time.sleep(30)
+
+
+threading.Thread(target=intraday_loop, daemon=True).start()
 
 
 # ──────────────────────────────────────────────
