@@ -415,10 +415,20 @@ def intraday_monitor():
 
     reset_daily_state()
 
+    # 名單是空的（伺服器重啟後）→ 自動抓今日資料
     if not _watchlist_today:
-        return
+        logger.info("Intraday monitor: watchlist empty, auto-fetching...")
+        candidates = screen()
+        if candidates:
+            global _watchlist_today
+            _watchlist_today = [{**c, "est_vol": max(1, int(c["vol"] * 0.02))}
+                                for c in candidates]
+            logger.info(f"Auto-loaded {len(_watchlist_today)} stocks into watchlist")
+        else:
+            logger.info("Intraday monitor: no candidates found")
+            return
 
-    logger.info(f"Intraday monitor: {len(_watchlist_today)} stocks")
+    logger.info(f"Intraday monitor: checking {len(_watchlist_today)} stocks")
 
     for stock in _watchlist_today:
         code = stock["code"]
