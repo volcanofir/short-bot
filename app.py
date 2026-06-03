@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import requests
 from flask import Flask, request
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -8,6 +9,7 @@ import pytz
 import logging
 import threading
 import time
+from pathlib import Path
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -19,10 +21,30 @@ CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 LINE_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_USER_ID = os.environ.get("LINE_USER_ID", "")
 FUGLE_TOKEN = os.environ.get("FUGLE_API_TOKEN", "")
+FINMIND_TOKEN = os.environ.get("FINMIND_API_TOKEN", "")
+ORDERBOOK_LOG_DIR = os.environ.get("ORDERBOOK_LOG_DIR", "data/orderbook")
+ORDERBOOK_LOG_ENABLED = os.environ.get("ORDERBOOK_LOG_ENABLED", "true").lower() == "true"
 
 TW_TZ = pytz.timezone("Asia/Taipei")
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 TG_API = f"https://api.telegram.org/bot{TG_TOKEN}"
+
+SCREEN_MIN_PCT = 3.0
+SCREEN_MAX_PCT = 6.0
+SCREEN_MIN_VOL = 500
+SCREEN_MAX_PRICE = 1000
+RESISTANCE_PCT = 2.5
+OPEN_PULLBACK_MIN_PCT = 0.5
+OPEN_VOLUME_PCT = 0.02
+OPEN_VOLUME_LOOSE_MULTIPLIER = 1.5
+INTRADAY_ALERT_END_HOUR = 10
+ASK_BID_DANGER_RATIO = 4.0
+NEAR_RESISTANCE_PCT = 0.4
+WEAK_OPEN_MAX_PCT = 2.0
+HOT_MONEY_OPEN_MAX_PCT = 6.0
+SMA5_NEAR_PCT = 1.5
+BROKER_ACTIVE_BRANCH_THRESHOLD = 12
+BROKER_SELL_BRANCH_THRESHOLD = 8
 
 # ── 盤中監控狀態 ──
 _watchlist_today = []
@@ -164,8 +186,20 @@ def get_next_trading_day(d):
     return next_d
 
 
+def symbol_for_code(code, market=None):
+    code = str(code)
+    if market == "上櫃":
+        return f"{code}.TWO"
+    if market == "上市":
+        return f"{code}.TW"
+    for symbol in SYMBOLS:
+        if symbol.startswith(f"{code}."):
+            return symbol
+    return f"{code}.TW"
+
+
 def calc_trade(close):
-    watch_line = round(close * 1.025, 1)
+    watch_line = round(close * (1 + RESISTANCE_PCT / 100), 1)
     stop_ref = round(close * 1.020, 1)
     risk = stop_ref - close
     target_ref = round(close - risk * 2, 1)
@@ -186,6 +220,154 @@ def get_signal(pct, vol):
 # Fugle 即時報價
 # ──────────────────────────────────────────────
 
+def normalize_order_levels(levels):
+    normalized = []
+    for level in levels or []:
+        try:
+            price = level.get("price")
+            size = level.get("size", level.get("volume", 0))
+            if price is None or size is None:
+                continue
+            normalized.append({"price": round(float(price), 2), "size": int(size)})
+        except Exception:
+            continue
+    return normalized[:5]
+
+
+def analyze_order_book(bids, asks, resistance_line):
+    bid_size = sum(x["size"] for x in bids)
+    ask_size = sum(x["size"] for x in asks)
+    ratio = round(ask_size / bid_size, 2) if bid_size > 0 else None
+    near_resistance_asks = [
+        x for x in asks
+        if resistance_line and x["price"] >= resistance_line * (1 - NEAR_RESISTANCE_PCT / 100)
+    ]
+    near_ask_size = sum(x["size"] for x in near_resistance_asks)
+
+    danger = False
+    reasons = []
+    if ratio is not None and ratio >= ASK_BID_DANGER_RATIO:
+        danger = True
+        reasons.append(f"委賣/委買={ratio}:1")
+    if near_ask_size and ask_size and near_ask_size / ask_size >= 0.5:
+        danger = True
+        reasons.append(f"弱勢基準附近委賣集中{near_ask_size}張")
+
+    return {
+        "bid_size": bid_size,
+        "ask_size": ask_size,
+        "ask_bid_ratio": ratio,
+        "near_ask_size": near_ask_size,
+        "danger": danger,
+        "reason": "、".join(reasons) if reasons else "五檔未見明顯大賣壓佈局",
+    }
+
+
+def log_orderbook_snapshot(stock, quote, resistance_line, order_book, stage, setup_name=None):
+    if not ORDERBOOK_LOG_ENABLED:
+        return
+    try:
+        now = datetime.now(TW_TZ)
+        root = Path(ORDERBOOK_LOG_DIR)
+        root.mkdir(parents=True, exist_ok=True)
+        path = root / f"orderbook_{now.strftime('%Y%m%d')}.jsonl"
+        payload = {
+            "ts": now.isoformat(),
+            "stage": stage,
+            "setup": setup_name,
+            "code": stock.get("code"),
+            "name": stock.get("name"),
+            "market": stock.get("market"),
+            "current": quote.get("current"),
+            "pct": quote.get("pct"),
+            "open": quote.get("open"),
+            "open_pct": quote.get("open_pct"),
+            "volume": quote.get("vol"),
+            "day_high": quote.get("day_high"),
+            "day_low": quote.get("day_low"),
+            "resistance_line": resistance_line,
+            "order_book": order_book,
+            "bids": quote.get("bids", []),
+            "asks": quote.get("asks", []),
+        }
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.error(f"Orderbook log error: {e}")
+
+
+def fetch_broker_context(code, start_date=None, days=5):
+    if not FINMIND_TOKEN:
+        return {}
+    if start_date is None:
+        start_date = (datetime.now(TW_TZ) - timedelta(days=days)).date()
+    try:
+        params = {
+            "dataset": "TaiwanStockTradingDailyReport",
+            "stock_id": str(code),
+            "start_date": start_date.strftime("%Y-%m-%d") if hasattr(start_date, "strftime") else str(start_date),
+            "token": FINMIND_TOKEN,
+        }
+        r = requests.get("https://api.finmindtrade.com/api/v4/data", params=params, timeout=12)
+        if r.status_code != 200:
+            logger.info(f"FinMind broker status {r.status_code}: {code}")
+            return {}
+        data = r.json().get("data", []) or []
+        if not data:
+            return {}
+        latest_date = max(str(row.get("date", "")) for row in data)
+        rows = [row for row in data if str(row.get("date", "")) == latest_date]
+        parsed = []
+        for row in rows:
+            try:
+                buy = int(float(row.get("buy", 0) or row.get("buy_volume", 0) or 0))
+                sell = int(float(row.get("sell", 0) or row.get("sell_volume", 0) or 0))
+                if buy == 0 and sell == 0:
+                    continue
+                parsed.append({
+                    "broker": row.get("securities_trader_branch_name") or row.get("broker") or row.get("dealer_name") or "",
+                    "buy": buy,
+                    "sell": sell,
+                    "net": buy - sell,
+                })
+            except Exception:
+                continue
+        if not parsed:
+            return {}
+
+        active = len(parsed)
+        sell_branches = sum(1 for x in parsed if x["sell"] > x["buy"])
+        buy_branches = sum(1 for x in parsed if x["buy"] > x["sell"])
+        net = sum(x["net"] for x in parsed)
+        total_sell = sum(x["sell"] for x in parsed)
+        top_sell = sorted(parsed, key=lambda x: x["sell"], reverse=True)[:3]
+        top_sell_total = sum(x["sell"] for x in top_sell)
+        top_sell_ratio = round(top_sell_total / total_sell * 100, 1) if total_sell else 0
+
+        notes = []
+        if active >= BROKER_ACTIVE_BRANCH_THRESHOLD:
+            notes.append("分點活躍/籌碼較雜")
+        if sell_branches >= BROKER_SELL_BRANCH_THRESHOLD:
+            notes.append("多分點偏賣")
+        if net < 0:
+            notes.append(f"分點淨賣{abs(net):,}張")
+        if top_sell_ratio >= 50:
+            notes.append(f"前三賣方集中{top_sell_ratio}%")
+
+        return {
+            "broker_date": latest_date,
+            "broker_active": active,
+            "broker_sell_branches": sell_branches,
+            "broker_buy_branches": buy_branches,
+            "broker_net": net,
+            "broker_top_sell_ratio": top_sell_ratio,
+            "broker_notes": notes,
+        }
+    except Exception as e:
+        logger.error(f"FinMind broker error {code}: {e}")
+        return {}
+
+
 def fugle_quote(code):
     if not FUGLE_TOKEN:
         return None
@@ -197,19 +379,27 @@ def fugle_quote(code):
         data = r.json()
         current = data.get("lastPrice") or data.get("closePrice")
         prev_close = data.get("previousClose") or data.get("referencePrice")
+        open_price = data.get("openPrice")
         day_high = data.get("highPrice")
         day_low = data.get("lowPrice")
         volume = data.get("totalVolume", 0)
+        bids = normalize_order_levels(data.get("bids", []))
+        asks = normalize_order_levels(data.get("asks", []))
         if not current or not prev_close or prev_close <= 0:
             return None
         pct = (current - prev_close) / prev_close * 100
+        open_pct = (open_price - prev_close) / prev_close * 100 if open_price else None
         return {
             "current": round(current, 2),
             "prev_close": round(prev_close, 2),
+            "open": round(open_price, 2) if open_price else None,
+            "open_pct": round(open_pct, 2) if open_pct is not None else None,
             "pct": round(pct, 2),
             "vol": int(volume) // 1000,
             "day_high": round(day_high, 2) if day_high else None,
             "day_low": round(day_low, 2) if day_low else None,
+            "bids": bids,
+            "asks": asks,
         }
     except Exception as e:
         logger.error(f"Fugle quote error {code}: {e}")
@@ -252,6 +442,69 @@ def fetch_stock_history(symbol, days=5):
         return None
 
 
+def fetch_daily_context(symbol):
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    params = {"interval": "1d", "range": "1mo", "includePrePost": "false"}
+    try:
+        r = requests.get(url, params=params, headers={"User-Agent": UA}, timeout=8)
+        if r.status_code != 200:
+            return {}
+        data = r.json()
+        result = data.get("chart", {}).get("result", [])
+        if not result:
+            return {}
+        chart = result[0]
+        q = chart.get("indicators", {}).get("quote", [{}])[0]
+        opens = q.get("open", [])
+        highs = q.get("high", [])
+        closes = q.get("close", [])
+        volumes = q.get("volume", [])
+        rows = [
+            {"open": o, "high": h, "close": c, "vol": int(v) // 1000}
+            for o, h, c, v in zip(opens, highs, closes, volumes)
+            if o is not None and h is not None and c is not None and v is not None
+        ]
+        if len(rows) < 6:
+            return {}
+
+        close = rows[-1]["close"]
+        sma5 = sum(x["close"] for x in rows[-5:]) / 5
+        recent_3_high = max(x["high"] for x in rows[-3:])
+        prior_high = max(x["high"] for x in rows[:-3])
+        three_day_no_high = recent_3_high <= prior_high
+
+        strong_open_days = 0
+        for i in (-2, -1):
+            prev_close = rows[i - 1]["close"]
+            if prev_close > 0:
+                open_pct = (rows[i]["open"] - prev_close) / prev_close * 100
+                if open_pct >= 9:
+                    strong_open_days += 1
+
+        notes = []
+        if three_day_no_high:
+            notes.append("三日不過高")
+        if close < sma5:
+            notes.append("收盤跌破5日線")
+        elif abs(close - sma5) / sma5 * 100 <= SMA5_NEAR_PCT:
+            notes.append("接近5日線")
+        if strong_open_days >= 2:
+            notes.append("連2日強勢開盤")
+
+        return {
+            "prev_high": round(rows[-1]["high"], 2),
+            "sma5": round(sma5, 2),
+            "below_sma5": close < sma5,
+            "near_sma5": abs(close - sma5) / sma5 * 100 <= SMA5_NEAR_PCT,
+            "three_day_no_high": three_day_no_high,
+            "two_strong_opens": strong_open_days >= 2,
+            "daily_notes": notes,
+        }
+    except Exception as e:
+        logger.error(f"Daily context error {symbol}: {e}")
+        return {}
+
+
 def fetch_intraday_yahoo(symbol, target_date):
     now = datetime.now(TW_TZ)
     days_ago = (now.date() - target_date).days
@@ -292,6 +545,44 @@ def fetch_intraday_yahoo(symbol, target_date):
         return None
 
 
+def fetch_intraday_rows(symbol, target_date):
+    now = datetime.now(TW_TZ)
+    days_ago = (now.date() - target_date).days
+    interval = "1m" if days_ago <= 6 else "1h"
+    range_str = "7d" if days_ago <= 6 else "1mo"
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    params = {"interval": interval, "range": range_str, "includePrePost": "false"}
+    try:
+        r = requests.get(url, params=params, headers={"User-Agent": UA}, timeout=10)
+        if r.status_code != 200:
+            return [], interval
+        data = r.json()
+        result = data.get("chart", {}).get("result", [])
+        if not result:
+            return [], interval
+        chart = result[0]
+        q = chart.get("indicators", {}).get("quote", [{}])[0]
+        opens = q.get("open", [])
+        highs = q.get("high", [])
+        lows = q.get("low", [])
+        closes = q.get("close", [])
+        timestamps = chart.get("timestamp", [])
+        rows = []
+        for ts, o, h, l, c in zip(timestamps, opens, highs, lows, closes):
+            if o is None or h is None or l is None or c is None:
+                continue
+            dt = datetime.fromtimestamp(ts, TW_TZ)
+            if dt.date() != target_date:
+                continue
+            if dt.hour < 9 or dt.hour > 13:
+                continue
+            rows.append({"dt": dt, "open": o, "high": h, "low": l, "close": c})
+        return rows, interval
+    except Exception as e:
+        logger.error(f"Intraday rows error {symbol}: {e}")
+        return [], interval
+
+
 def fetch_all():
     results = []
     headers = {"User-Agent": UA, "Accept": "application/json"}
@@ -310,16 +601,19 @@ def fetch_all():
                     prev = float(q.get("regularMarketPreviousClose", 0) or 0)
                     chg = float(q.get("regularMarketChange", 0) or 0)
                     vol = int(q.get("regularMarketVolume", 0) or 0) // 1000
-                    if close <= 0 or prev <= 0 or close > 1000:
+                    if close <= 0 or prev <= 0 or close > SCREEN_MAX_PRICE:
                         continue
                     pct = chg / prev * 100
                     market = "上市" if symbol.endswith(".TW") else "上櫃"
-                    if 3.0 <= pct <= 7.0 and vol >= 500:
+                    if SCREEN_MIN_PCT <= pct <= SCREEN_MAX_PCT and vol >= SCREEN_MIN_VOL:
                         trade = calc_trade(close)
+                        context = fetch_daily_context(symbol)
+                        broker_context = fetch_broker_context(code)
                         results.append({
                             "market": market, "code": code, "name": name,
                             "close": round(close, 2), "pct": round(pct, 2),
-                            "vol": vol, "signal": get_signal(pct, vol), **trade
+                            "vol": vol, "signal": get_signal(pct, vol),
+                            **trade, **context, **broker_context
                         })
                 except Exception:
                     continue
@@ -330,16 +624,19 @@ def fetch_all():
     if not results:
         for symbol in SYMBOLS[:100]:
             data = fetch_stock_history(symbol)
-            if data and 3.0 <= data["pct"] <= 7.0 and data["vol"] >= 500 and data["close"] <= 1000:
+            if (data and SCREEN_MIN_PCT <= data["pct"] <= SCREEN_MAX_PCT
+                    and data["vol"] >= SCREEN_MIN_VOL and data["close"] <= SCREEN_MAX_PRICE):
                 code = symbol.replace(".TW", "").replace(".TWO", "")
                 market = "上市" if symbol.endswith(".TW") else "上櫃"
                 name = STOCK_NAMES.get(code, code)
                 trade = calc_trade(data["close"])
+                context = fetch_daily_context(symbol)
+                broker_context = fetch_broker_context(code)
                 results.append({
                     "market": market, "code": code, "name": name,
                     "close": data["close"], "pct": data["pct"],
                     "vol": data["vol"], "signal": get_signal(data["pct"], data["vol"]),
-                    **trade
+                    **trade, **context, **broker_context
                 })
             time.sleep(0.05)
 
@@ -373,9 +670,9 @@ def reset_daily_state():
         logger.info(f"Daily reset for {today}")
 
 
-def get_prev_day_high(code):
+def get_prev_day_high(code, market=None):
     """取得昨日最高價（用於判斷是否突破前高）"""
-    symbol = f"{code}.TW"
+    symbol = symbol_for_code(code, market)
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
     params = {"interval": "1d", "range": "5d", "includePrePost": "false"}
     try:
@@ -410,7 +707,7 @@ def intraday_monitor():
 
     if now.weekday() >= 5:
         return
-    if not (9 <= now.hour < 13 or (now.hour == 13 and now.minute <= 30)):
+    if not (9 <= now.hour < INTRADAY_ALERT_END_HOUR):
         return
 
     reset_daily_state()
@@ -420,7 +717,7 @@ def intraday_monitor():
         logger.info("Intraday monitor: watchlist empty, auto-fetching...")
         candidates = screen()
         if candidates:
-            _watchlist_today[:] = [{**c, "est_vol": max(1, int(c["vol"] * 0.02))}
+            _watchlist_today[:] = [{**c, "est_vol": max(1, int(c["vol"] * OPEN_VOLUME_PCT))}
                                    for c in candidates]
             logger.info(f"Auto-loaded {len(_watchlist_today)} stocks into watchlist")
         else:
@@ -440,24 +737,45 @@ def intraday_monitor():
 
         current = quote["current"]
         pct_now = quote["pct"]
+        open_price = quote.get("open")
+        open_pct = quote.get("open_pct")
         day_high = quote["day_high"] or current
         watch_line = stock["watch_line"]
+        prev_high = get_prev_day_high(code, stock.get("market"))
+        resistance_line = min(watch_line, prev_high) if prev_high else watch_line
+        order_book = analyze_order_book(quote.get("bids", []), quote.get("asks", []), resistance_line)
+        log_orderbook_snapshot(stock, quote, resistance_line, order_book, "watchlist_scan")
 
-        # 基本進場條件：漲幅在 0.5%~2.5% 之間，還沒過觀察空點
-        if not (0.5 <= pct_now < 2.5 and current < watch_line):
+        # 老師提醒：價格優先，漲不過前一天高或 +2.5% 才算弱勢。
+        pullback_setup = OPEN_PULLBACK_MIN_PCT <= pct_now < RESISTANCE_PCT and current < resistance_line
+        break_open_setup = (
+            open_price and open_pct is not None
+            and current < open_price and current < resistance_line
+            and (
+                open_pct < WEAK_OPEN_MAX_PCT
+                or (stock.get("two_strong_opens") and open_pct < HOT_MONEY_OPEN_MAX_PCT)
+            )
+        )
+        if not (pullback_setup or break_open_setup):
             continue
+        setup_name = "破開盤價弱勢" if break_open_setup else "小拉升不過基準"
 
-        # 大叔策略：量縮確認（盤中成交量低於昨日總量的 2%）
+        # 試撮/開盤量以昨日總量 2% 為基準，放寬最多到 3%。
         est_vol_threshold = stock.get("est_vol", 0)
-        if est_vol_threshold > 0 and quote["vol"] > est_vol_threshold * 3:
-            # 盤中量是累積的，用3倍試撮門檻當參考（避免太早篩掉）
-            logger.info(f"{code} 盤中量{quote['vol']} > 門檻{est_vol_threshold*3}，量未縮，跳過")
+        loose_vol = int(est_vol_threshold * OPEN_VOLUME_LOOSE_MULTIPLIER)
+        if est_vol_threshold > 0 and quote["vol"] > loose_vol:
+            logger.info(f"{code} 開盤累積量{quote['vol']} > 放寬門檻{loose_vol}，量未縮，跳過")
             continue
 
-        # 大叔策略：今日高點已突破昨日高點 → 不空，放棄
-        prev_high = get_prev_day_high(code)
-        if prev_high and day_high >= prev_high:
-            logger.info(f"{code} 今日高{day_high} >= 昨日高{prev_high}，跳過不空")
+        if day_high >= resistance_line:
+            logger.info(f"{code} 今日高{day_high} >= 弱勢基準{resistance_line}，跳過不空")
+            continue
+
+        if not order_book["bid_size"] or not order_book["ask_size"]:
+            logger.info(f"{code} 無完整五檔資料，跳過自動候選提醒")
+            continue
+        if order_book["danger"]:
+            logger.info(f"{code} 五檔風險：{order_book['reason']}，跳過不空")
             continue
 
         _alerted_today.add(code)
@@ -469,34 +787,47 @@ def intraday_monitor():
         stop_pct = round(risk / current * 100, 2)
         target_pct = round(risk * 2 / current * 100, 2)
 
-        # 建議掛空區間：現價到觀察空點之間
+        # 建議掛空區間：破開盤價時以開盤價為反壓，否則以弱勢基準為反壓。
+        entry_cap = min(open_price, resistance_line) if break_open_setup and open_price else resistance_line
         entry_low = round(current * 1.005, 1)
-        entry_high = round(watch_line - 0.1, 1)
+        entry_high = round(entry_cap - 0.1, 1)
+        if entry_high <= entry_low:
+            logger.info(f"{code} 掛空區間不足：{entry_low}~{entry_high}，跳過")
+            continue
         entry_mid = round((entry_low + entry_high) / 2, 1)
 
         # 記錄交易（供收盤結算用）
         _today_trades.append({
-            "code": code, "name": stock["name"],
-            "entry": entry_mid, "stop": stop_actual,
-            "target": target_actual, "watch_line": watch_line,
+            "code": code, "name": stock["name"], "market": stock.get("market"),
+            "entry": entry_mid, "stop": stop_actual, "setup": setup_name,
+            "target": target_actual, "watch_line": resistance_line,
             "time": now.strftime("%H:%M"),
         })
 
         now_str = now.strftime("%H:%M")
         prev_high_str = f"{prev_high}" if prev_high else "無資料"
+        open_str = f"{open_price}元（{open_pct:+.2f}%）" if open_price and open_pct is not None else "無資料"
+        daily_notes = "、".join(stock.get("daily_notes", [])) or "一般爆量強勢股"
+        broker_notes = "、".join(stock.get("broker_notes", [])) or ("未接分點資料" if not FINMIND_TOKEN else "分點未見明顯賣壓")
         alert = (
-            f"🚨 <b>盤中進場提醒 {now_str}</b>\n\n"
+            f"🚨 <b>盤中候選提醒 {now_str}</b>\n\n"
             f"{stock['signal']} <b>{code} {stock['name']}</b> [{stock['market']}]\n"
+            f"  🔎 型態：<b>{setup_name}</b>\n"
+            f"  🧭 日線脈絡：{daily_notes}\n"
+            f"  🧾 籌碼分點：{broker_notes}\n"
             f"  📍 現價：<b>{current}</b> 元（+{pct_now:.2f}%）\n"
-            f"  📊 今日高點：<b>{day_high}</b> 元 ✅（未突破昨高 {prev_high_str} 元）\n"
+            f"  🚪 開盤價：<b>{open_str}</b>\n"
+            f"  📊 今日高點：<b>{day_high}</b> 元 ✅（弱勢基準 {resistance_line} 元｜昨高 {prev_high_str}）\n"
+            f"  📚 五檔：委買 {order_book['bid_size']} 張／委賣 {order_book['ask_size']} 張"
+            f"（{order_book['reason']}）\n"
             f"  昨收：{stock['close']} 元（昨漲 +{stock['pct']}%）\n\n"
             f"  ━━━━━━ 進場建議 ━━━━━━\n"
             f"  🎯 掛空區間：<b>{entry_low}~{entry_high}</b> 元（試算以 {entry_mid} 元計）\n"
-            f"     （等小拉升掛高空，漲不過 {watch_line} 才空）\n\n"
+            f"     （等小拉升掛高空，漲不過 {resistance_line} 才空）\n\n"
             f"  🛑 停損：過今日高點 <b>{stop_actual}</b> 元（+{stop_pct}%）\n"
             f"  💰 目標：<b>{target_actual}</b> 元（-{target_pct}%，賺賠比 2:1）\n\n"
-            f"  ⚠️ 確認試撮量縮 + 趨勢線後再掛單\n"
-            f"  ⚠️ 全程當沖，最晚 13:00 前平倉"
+            f"  ⚠️ 仍需人工確認第一盤量縮、五檔掛單變化與趨勢轉弱\n"
+            f"  ⚠️ 這是候選提醒，不是自動下單訊號"
         )
 
         # 盤中提醒只發 Telegram，不打擾 LINE
@@ -615,7 +946,7 @@ def format_daily_summary():
             day_high_now = q.get("day_high") or close_price
         else:
             # Fugle 收盤後可能無資料，用 Yahoo 備用
-            hist = fetch_stock_history(f"{code}.TW")
+            hist = fetch_stock_history(symbol_for_code(code, t.get("market")))
             close_price = hist["close"] if hist else entry
             day_low = close_price
             day_high_now = close_price
@@ -668,6 +999,45 @@ def format_daily_summary():
     )
     return "\n".join(lines)
 
+def daily_context_from_rows(rows, idx):
+    if idx < 5:
+        return {}, []
+    close = rows[idx]["close"]
+    sma5 = sum(x["close"] for x in rows[idx-4:idx+1]) / 5
+    recent_3_high = max(x["high"] for x in rows[max(0, idx-2):idx+1])
+    prior_rows = rows[:max(0, idx-2)]
+    prior_high = max((x["high"] for x in prior_rows), default=recent_3_high)
+    three_day_no_high = recent_3_high <= prior_high
+
+    strong_open_days = 0
+    for j in (idx-1, idx):
+        if j <= 0:
+            continue
+        prev_close = rows[j-1]["close"]
+        if prev_close > 0:
+            open_pct = (rows[j]["open"] - prev_close) / prev_close * 100
+            if open_pct >= 9:
+                strong_open_days += 1
+
+    notes = []
+    if three_day_no_high:
+        notes.append("三日不過高")
+    if close < sma5:
+        notes.append("收盤跌破5日線")
+    elif abs(close - sma5) / sma5 * 100 <= SMA5_NEAR_PCT:
+        notes.append("接近5日線")
+    if strong_open_days >= 2:
+        notes.append("連2日強勢開盤")
+
+    return {
+        "sma5": round(sma5, 2),
+        "three_day_no_high": three_day_no_high,
+        "below_sma5": close < sma5,
+        "near_sma5": abs(close - sma5) / sma5 * 100 <= SMA5_NEAR_PCT,
+        "two_strong_opens": strong_open_days >= 2,
+    }, notes
+
+
 def backtest_symbol(symbol, period_days):
     range_map = {7: "1mo", 15: "1mo", 30: "3mo"}
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
@@ -683,73 +1053,126 @@ def backtest_symbol(symbol, period_days):
             return []
         chart = result[0]
         q = chart.get("indicators", {}).get("quote", [{}])[0]
+        opens = q.get("open", [])
+        highs = q.get("high", [])
+        lows = q.get("low", [])
         closes = q.get("close", [])
         volumes = q.get("volume", [])
         timestamps = chart.get("timestamp", [])
         valid = []
-        for t, c, v in zip(timestamps, closes, volumes):
-            if c is not None and v is not None:
+        for t, o, h, l, c, v in zip(timestamps, opens, highs, lows, closes, volumes):
+            if o is not None and h is not None and l is not None and c is not None and v is not None:
                 valid.append({
                     "date": datetime.fromtimestamp(t, TW_TZ).date(),
-                    "close": c, "vol": int(v) // 1000
+                    "open": o, "high": h, "low": l, "close": c, "vol": int(v) // 1000
                 })
-        if len(valid) < 3:
+        if len(valid) < 7:
             return []
         cutoff = (datetime.now(TW_TZ) - timedelta(days=period_days)).date()
-        valid = [x for x in valid if x["date"] >= cutoff]
         trades = []
         for i in range(1, len(valid) - 1):
             today = valid[i]
             next_day = valid[i+1]
+            if today["date"] < cutoff:
+                continue
             prev_close = valid[i-1]["close"]
             if prev_close <= 0 or today["close"] <= 0:
                 continue
             pct = (today["close"] - prev_close) / prev_close * 100
-            if not (3.0 <= pct <= 7.0 and today["vol"] >= 500 and today["close"] <= 1000):
+            if not (SCREEN_MIN_PCT <= pct <= SCREEN_MAX_PCT
+                    and today["vol"] >= SCREEN_MIN_VOL and today["close"] <= SCREEN_MAX_PRICE):
                 continue
-            watch_line = round(today["close"] * 1.025, 1)
-            stop_price = round(today["close"] * 1.020, 1)
-            risk = stop_price - today["close"]
-            target_price = round(today["close"] - risk * 2, 1)
-            intraday = fetch_intraday_yahoo(symbol, next_day["date"])
+            context, notes = daily_context_from_rows(valid, i)
+            watch_line = round(today["close"] * (1 + RESISTANCE_PCT / 100), 1)
+            resistance_line = min(watch_line, today["high"])
+            intraday_rows, ivl = fetch_intraday_rows(symbol, next_day["date"])
             time.sleep(0.1)
-            if not intraday:
+            if not intraday_rows:
                 profit = round((today["close"] - next_day["close"]) / today["close"] * 100, 2)
                 trades.append({
                     "date": today["date"].strftime("%m/%d"),
                     "next_date": next_day["date"].strftime("%m/%d"),
                     "close": today["close"], "pct": round(pct, 2),
-                    "watch_line": watch_line, "stop": stop_price, "target": target_price,
+                    "watch_line": resistance_line, "stop": None, "target": None,
                     "profit": profit, "result": "無盤中資料",
-                    "win": profit > 0, "hit_in_hour": None
+                    "win": profit > 0, "hit_in_hour": None,
+                    "setup": "無盤中資料", "notes": notes
                 })
-            else:
-                h1_high = intraday["max_high"]
-                h1_low = intraday["min_low"]
-                ivl = intraday["interval"]
-                if h1_high >= watch_line:
-                    continue
-                elif h1_high >= stop_price:
-                    profit = round(-(stop_price - today["close"]) / today["close"] * 100, 2)
+                continue
+
+            open_price = intraday_rows[0]["open"]
+            if not open_price:
+                continue
+            open_pct = (open_price - today["close"]) / today["close"] * 100
+            setup_idx = None
+            setup_name = None
+
+            for idx, row in enumerate(intraday_rows):
+                if row["dt"].hour >= INTRADAY_ALERT_END_HOUR:
+                    break
+                current = row["close"]
+                pct_now = (current - today["close"]) / today["close"] * 100
+                day_high_so_far = max(x["high"] for x in intraday_rows[:idx+1])
+                if day_high_so_far >= resistance_line:
+                    break
+                pullback_setup = (
+                    OPEN_PULLBACK_MIN_PCT <= pct_now < RESISTANCE_PCT
+                    and current < resistance_line
+                )
+                break_open_setup = (
+                    current < open_price and current < resistance_line
+                    and (
+                        open_pct < WEAK_OPEN_MAX_PCT
+                        or (context.get("two_strong_opens") and open_pct < HOT_MONEY_OPEN_MAX_PCT)
+                    )
+                )
+                if pullback_setup or break_open_setup:
+                    setup_idx = idx
+                    setup_name = "破開盤價弱勢" if break_open_setup else "小拉升不過基準"
+                    break
+
+            if setup_idx is None:
+                continue
+
+            setup_row = intraday_rows[setup_idx]
+            day_high_so_far = max(x["high"] for x in intraday_rows[:setup_idx+1])
+            entry_price = setup_row["close"]
+            stop_price = round(day_high_so_far + 0.1, 1)
+            risk = stop_price - entry_price
+            if risk <= 0:
+                continue
+            target_price = round(entry_price - risk * 2, 1)
+            exit_rows = intraday_rows[setup_idx:]
+            exit_time = "收盤"
+            exit_price = next_day["close"]
+            result_type = "收盤了結"
+            hit = False
+            for row in exit_rows:
+                if row["high"] >= stop_price:
+                    exit_time = row["dt"].strftime("%H:%M")
+                    exit_price = stop_price
                     result_type = f"停損（{ivl}）"
-                    win, hit = False, False
-                elif h1_low <= target_price:
-                    profit = round((today["close"] - target_price) / today["close"] * 100, 2)
-                    result_type = f"✅1小時達標（{ivl}）"
-                    win, hit = True, True
-                else:
-                    profit = round((today["close"] - next_day["close"]) / today["close"] * 100, 2)
-                    result_type = "收盤了結"
-                    win = profit > 0
                     hit = False
-                trades.append({
-                    "date": today["date"].strftime("%m/%d"),
-                    "next_date": next_day["date"].strftime("%m/%d"),
-                    "close": today["close"], "pct": round(pct, 2),
-                    "watch_line": watch_line, "stop": stop_price, "target": target_price,
-                    "profit": profit, "result": result_type,
-                    "win": win, "hit_in_hour": hit
-                })
+                    break
+                if row["low"] <= target_price:
+                    exit_time = row["dt"].strftime("%H:%M")
+                    exit_price = target_price
+                    result_type = f"✅達標（{ivl}）"
+                    hit = row["dt"].hour < INTRADAY_ALERT_END_HOUR
+                    break
+
+            profit = round((entry_price - exit_price) / entry_price * 100, 2)
+            win = profit > 0
+            trades.append({
+                "date": today["date"].strftime("%m/%d"),
+                "next_date": next_day["date"].strftime("%m/%d"),
+                "close": today["close"], "pct": round(pct, 2),
+                "open": round(open_price, 2), "open_pct": round(open_pct, 2),
+                "entry": round(entry_price, 2), "entry_time": setup_row["dt"].strftime("%H:%M"),
+                "watch_line": resistance_line, "stop": stop_price, "target": target_price,
+                "profit": profit, "result": result_type, "exit_time": exit_time,
+                "win": win, "hit_in_hour": hit, "setup": setup_name, "notes": notes
+            })
         return trades
     except Exception as e:
         logger.error(f"Backtest {symbol}: {e}")
@@ -798,29 +1221,33 @@ def format_report(candidates):
             "（量能不足、漲幅不符或股價超過千元）"
         )
 
-    _watchlist_today = [{**c, "est_vol": max(1, int(c["vol"] * 0.02))} for c in candidates]
+    _watchlist_today = [{**c, "est_vol": max(1, int(c["vol"] * OPEN_VOLUME_PCT))} for c in candidates]
 
     lines = [f"📊 <b>{last_str} 收盤篩選｜{next_str} 觀察名單（{len(candidates)} 支）</b>\n"]
     for c in candidates:
-        est_vol = max(1, int(c["vol"] * 0.02))
+        est_vol = max(1, int(c["vol"] * OPEN_VOLUME_PCT))
+        daily_notes = "、".join(c.get("daily_notes", [])) or "一般爆量強勢股"
+        broker_notes = "、".join(c.get("broker_notes", [])) or ("未接分點資料" if not FINMIND_TOKEN else "分點未見明顯賣壓")
         lines.append(
             f"{c['signal']} <b>{c['code']} {c['name']}</b> [{c['market']}]\n"
             f"  {last_str}收：<b>{c['close']}</b>元  漲幅：<b>+{c['pct']}%</b>  量：<b>{c['vol']:,}</b>張\n"
+            f"  🧭 日線脈絡：{daily_notes}\n"
+            f"  🧾 籌碼分點：{broker_notes}\n"
             f"  ━━━━━━━━━━━━\n"
-            f"  👁 {next_str} 觀察空點：漲不過 <b>{c['watch_line']}</b> 元（+2.5%）才考慮空\n"
+            f"  👁 {next_str} +{RESISTANCE_PCT:g}%參考：漲不過 <b>{c['watch_line']}</b> 元才考慮空（盤中另與昨高取低）\n"
             f"  🛑 停損參考：過早盤高點（參考 <b>{c['stop_ref']}</b> 元）\n"
             f"  💰 目標參考：<b>{c['target_ref']}</b> 元（賺賠比 2:1）\n"
-            f"  📌 試撮量需低於 {est_vol:,} 張"
+            f"  📌 第一盤量最好低於 {est_vol:,} 張（放寬最多約 {int(est_vol * OPEN_VOLUME_LOOSE_MULTIPLIER):,} 張）"
         )
 
     lines.append(
         f"\n⚠️ <b>{next_str} 進場前需確認：</b>\n"
         "① 試撮量縮（低於上方門檻）\n"
-        "② 漲不過觀察空點（+2.5%）\n"
-        "③ 盤中量縮（低於試撮門檻）\n"
-        "④ 趨勢線轉折後再空\n"
-        "⑤ 全程當沖，最晚 13:00 前平倉\n\n"
-        "🔔 開盤後每5分鐘盤中監控，符合條件 Telegram 即時提醒"
+        f"② 漲不過昨高或 +{RESISTANCE_PCT:g}% 弱勢基準\n"
+        "③ 小拉升不過基準，或弱勢開盤後跌破開盤價\n"
+        "④ 五檔掛單沒有異常大賣壓佈局\n"
+        "⑤ 股期仍需人工或外部資料確認；分點資料為盤後輔助\n\n"
+        f"🔔 開盤後監控到 {INTRADAY_ALERT_END_HOUR}:00，符合條件 Telegram 候選提醒"
     )
     return "\n".join(lines)
 
@@ -836,24 +1263,28 @@ def format_line_morning(candidates):
 
     lines = [f"📊 {next_str} 做空觀察名單（開盤注意）\n"]
     for c in candidates:
-        est_vol = max(1, int(c["vol"] * 0.02))
+        est_vol = max(1, int(c["vol"] * OPEN_VOLUME_PCT))
+        daily_notes = "、".join(c.get("daily_notes", [])) or "一般爆量強勢股"
+        broker_notes = "、".join(c.get("broker_notes", [])) or ("未接分點資料" if not FINMIND_TOKEN else "分點未見明顯賣壓")
         lines.append(
             f"{'🔴' if '高度' in c['signal'] else '🟡'} {c['code']} {c['name']}\n"
             f"  昨收 {c['close']}元 漲{c['pct']}%\n"
-            f"  空點：漲不過 {c['watch_line']} 元\n"
+            f"  日線：{daily_notes}\n"
+            f"  分點：{broker_notes}\n"
+            f"  弱勢基準：漲不過 {c['watch_line']} 元\n"
             f"  停損：過早盤高點\n"
             f"  目標：{c['target_ref']} 元\n"
-            f"  試撮量 < {est_vol:,} 張"
+            f"  第一盤量最好 < {est_vol:,} 張"
         )
 
-    lines.append("\n記得確認試撮量縮+趨勢線才進場")
+    lines.append("\n記得確認昨高/+2.5%壓力、第一盤量縮、破開盤價/趨勢轉弱；股期仍要人工看")
     return "\n".join(lines)
 
 
 def format_backtest(period_days, symbol_results, all_trades):
     lines = [f"📈 <b>回測報告（近 {period_days} 天）</b>"]
     note = "1分K" if period_days <= 7 else "1小時K"
-    lines.append(f"開盤1小時判斷：{note}\n")
+    lines.append(f"新版候選邏輯：{note}｜含破開盤價/日線脈絡，未含五檔、股期、籌碼分點\n")
     if not all_trades:
         lines.append("此期間無符合條件的進場機會")
         return "\n".join(lines)
@@ -867,6 +1298,11 @@ def format_backtest(period_days, symbol_results, all_trades):
     l_list = [t["profit"] for t in all_trades if not t["win"]]
     avg_win = round(sum(p_list)/len(p_list), 2) if p_list else 0
     avg_loss = round(sum(l_list)/len(l_list), 2) if l_list else 0
+    setup_counts = {}
+    for t in all_trades:
+        setup = t.get("setup", "未分類")
+        setup_counts[setup] = setup_counts.get(setup, 0) + 1
+    setup_text = "、".join(f"{k}{v}次" for k, v in sorted(setup_counts.items()))
     lines.append(
         f"📊 <b>整體統計</b>\n"
         f"  進場次數：{total} 次\n"
@@ -874,6 +1310,7 @@ def format_backtest(period_days, symbol_results, all_trades):
         f"  🕙 1小時內達標：<b>{hour_wins}</b> 次（{hour_rate}%）\n"
         f"  平均獲利：<b>{avg_win:+.2f}%</b> | 平均虧損：<b>{avg_loss:+.2f}%</b>\n"
         f"  平均每筆：<b>{avg_profit:+.2f}%</b>\n"
+        f"  型態分布：{setup_text}\n"
     )
     good = [(c, r) for c, r in symbol_results.items() if r["total"] >= 2 and r["win_rate"] >= 50]
     good.sort(key=lambda x: (-x[1]["hour_win_rate"], -x[1]["avg_profit"]))
@@ -890,12 +1327,18 @@ def format_backtest(period_days, symbol_results, all_trades):
     for t in recent:
         icon = "✅" if t["win"] else "❌"
         hour_tag = " 🕙1小時達標" if t.get("hit_in_hour") else ""
+        notes = "、".join(t.get("notes", [])) or "一般爆量強勢股"
+        open_info = ""
+        if t.get("open") is not None:
+            open_info = f" 開{t['open']}({t['open_pct']:+.2f}%)"
+        entry_info = f"{t.get('entry_time', '')} @ {t.get('entry', t['close'])}"
         lines.append(
-            f"  {icon} {t['date']}收{t['close']} +{t['pct']}%\n"
-            f"     空點{t['watch_line']} 停損{t['stop']} 目標{t['target']}\n"
+            f"  {icon} {t['date']}收{t['close']} +{t['pct']}%{open_info}\n"
+            f"     {t.get('setup', '候選')}｜{notes}\n"
+            f"     進場{entry_info} 弱勢基準{t['watch_line']} 停損{t['stop']} 目標{t['target']}\n"
             f"     {t['next_date']} → {t['result']}{hour_tag} {t['profit']:+.2f}%"
         )
-    lines.append("\n⚠️ 回測為理想當沖條件，實際須配合試撮量縮+趨勢確認")
+    lines.append("\n⚠️ 回測未納入歷史五檔、股期與券商籌碼分點，實際仍需人工/外部資料確認")
     return "\n".join(lines)
 
 
@@ -923,11 +1366,21 @@ def format_test():
         if q:
             lines.append(f"✅ Fugle 即時：正常")
             lines.append(f"   台積電：{q['current']}元 ({q['pct']:+.2f}%) 高{q['day_high']}")
+            if q.get("bids") and q.get("asks"):
+                ob = analyze_order_book(q["bids"], q["asks"], q["current"])
+                lines.append(
+                    f"✅ 五檔：委買{ob['bid_size']}張 / 委賣{ob['ask_size']}張 "
+                    f"({ob['reason']})"
+                )
+            else:
+                lines.append("⚠️ 五檔：目前無 bids/asks 資料")
         else:
             lines.append("⚠️ Fugle：無資料（非交易時段正常）")
     else:
         lines.append("❌ Fugle：未設定 Token")
 
+    lines.append(f"FinMind 分點：{'✅ 已設定' if FINMIND_TOKEN else '❌ 未設定 Token'}")
+    lines.append(f"五檔記錄：{'✅ 啟用' if ORDERBOOK_LOG_ENABLED else '❌ 關閉'}（{ORDERBOOK_LOG_DIR}）")
     lines.append(f"LINE 推播：{'✅' if LINE_TOKEN and LINE_USER_ID else '❌ 未設定'}")
     lines.append(f"盤中監控名單：{len(_watchlist_today)} 支")
     lines.append(f"今日已提醒：{len(_alerted_today)} 支")
@@ -991,15 +1444,15 @@ scheduler.start()
 
 
 # ──────────────────────────────────────────────
-# 盤中監控執行緒（09:00~09:15 每30秒，09:15~13:00 每1分鐘）
+# 盤中監控執行緒（09:00~09:15 每30秒，09:15~10:00 每1分鐘）
 # ──────────────────────────────────────────────
 
 def intraday_loop():
     """
     背景執行緒：持續執行盤中監控
     09:00~09:15：每 30 秒掃描一次（開盤關鍵期）
-    09:15~13:00：每 1 分鐘掃描一次
-    13:00 後停止
+    09:15~10:00：每 1 分鐘掃描一次
+    10:00 後停止自動候選提醒
     """
     logger.info("Intraday loop thread started")
     while True:
@@ -1010,8 +1463,8 @@ def intraday_loop():
             if now.weekday() < 5:
                 h, m = now.hour, now.minute
 
-                # 09:00~13:00 才執行
-                if (h == 9 and m >= 0) or (10 <= h < 13) or (h == 13 and m == 0):
+                # 老師策略重點在開盤後 30 分鐘到 1 小時。
+                if 9 <= h < INTRADAY_ALERT_END_HOUR:
                     start_ts = time.time()
                     intraday_monitor()
                     elapsed = time.time() - start_ts
@@ -1070,17 +1523,17 @@ def handle_update(update):
         tg_only(chat_id, format_test())
 
     elif text in ["/bt7", "回測7"]:
-        tg_send(chat_id, "📈 回測近7天（1分K），請稍候約45秒...")
+        tg_send(chat_id, "📈 新版回測近7天（含破開盤價/日線脈絡），請稍候...")
         results, trades = run_backtest(7)
         tg_only(chat_id, format_backtest(7, results, trades))
 
     elif text in ["/bt15", "回測15"]:
-        tg_send(chat_id, "📈 回測近15天（1小時K），請稍候約60秒...")
+        tg_send(chat_id, "📈 新版回測近15天（含破開盤價/日線脈絡），請稍候...")
         results, trades = run_backtest(15)
         tg_only(chat_id, format_backtest(15, results, trades))
 
     elif text in ["/bt30", "回測30"]:
-        tg_send(chat_id, "📈 回測近30天（1小時K），請稍候約90秒...")
+        tg_send(chat_id, "📈 新版回測近30天（含破開盤價/日線脈絡），請稍候...")
         results, trades = run_backtest(30)
         tg_only(chat_id, format_backtest(30, results, trades))
 
@@ -1098,9 +1551,10 @@ def handle_update(update):
             "/id — 查詢 Chat ID\n\n"
             "📅 推播時程：\n"
             "  08:50 LINE 早上觀察名單提醒\n"
-            "  09:00~13:30 Telegram 盤中即時提醒\n"
+            f"  09:00~{INTRADAY_ALERT_END_HOUR}:00 Telegram 盤中候選提醒\n"
             "  13:40 Telegram 收盤完整推播\n\n"
-            "📊 篩選：漲幅 3~9.5% + 量能 + 股價 ≤1000元"
+            f"📊 篩選：漲幅 {SCREEN_MIN_PCT:g}~{SCREEN_MAX_PCT:g}% + "
+            f"量能 ≥{SCREEN_MIN_VOL:,}張 + 股價 ≤{SCREEN_MAX_PRICE:,}元"
         ))
     else:
         tg_send(chat_id, "傳 /scan 篩選，/bt30 回測，/help 查看指令。")
@@ -1122,7 +1576,10 @@ def polling_loop():
             time.sleep(5)
 
 
-threading.Thread(target=polling_loop, daemon=True).start()
+if TG_TOKEN:
+    threading.Thread(target=polling_loop, daemon=True).start()
+else:
+    logger.warning("TELEGRAM_BOT_TOKEN is not set; Telegram polling disabled")
 
 
 @app.route("/")

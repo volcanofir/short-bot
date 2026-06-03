@@ -5,9 +5,21 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120
     envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
       - key: LINE_CHANNEL_ACCESS_TOKEN
         sync: false
       - key: LINE_CHANNEL_SECRET
         sync: false
       - key: LINE_USER_ID
         sync: false
+      - key: FUGLE_API_TOKEN
+        sync: false
+      - key: FINMIND_API_TOKEN
+        sync: false
+      - key: ORDERBOOK_LOG_ENABLED
+        value: "true"
+      - key: ORDERBOOK_LOG_DIR
+        value: data/orderbook
