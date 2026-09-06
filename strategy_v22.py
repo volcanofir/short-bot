@@ -293,6 +293,20 @@ base.screen_v2 = screen_v22
 legacy.screen = screen_v22
 
 
+def resistance_for_stock(stock, prev_high=None):
+    """Confirmed price gate.
+
+    Normal/failed-limit names use the weaker of prior high and +2.5%.
+    A successfully locked limit-up is a special case: prior high equals the
+    locked close, so the next-day rule instead uses the +2.5% line together
+    with the stricter open<2% / rebound<1% / break-open conditions.
+    """
+    if stock.get("limit_up_locked"):
+        return stock["watch_line"]
+    ph = prev_high if prev_high is not None else stock.get("prev_high")
+    return min(stock["watch_line"], ph) if ph else stock["watch_line"]
+
+
 # ---------------------------------------------------------------------------
 # Volume interpretation
 # ---------------------------------------------------------------------------
@@ -362,9 +376,24 @@ def opening_volume_state(stock, today_first_bar):
 # Preopen formatting (trial match + blue/red references)
 # ---------------------------------------------------------------------------
 def preopen_scan_once_v22():
-    # The captured V2.1 function uses module globals that now point at
-    # screen_v22, so we retain the original implementation without recursion.
-    return _v21_preopen_scan_once()
+    base._reset_v2_state_if_needed()
+    if not legacy._watchlist_today:
+        candidates = screen_v22()
+        if candidates:
+            base._populate_watchlist(candidates)
+
+    for stock in list(legacy._watchlist_today):
+        q = base.fugle_quote_v2(stock["code"])
+        if not q:
+            continue
+        base._record_trial(stock, q)
+        resistance = resistance_for_stock(stock, stock.get("prev_high"))
+        book = base.analyze_order_book_v2(stock["code"], q, resistance)
+        try:
+            legacy.log_orderbook_snapshot(stock, q, resistance, book, "preopen_trial")
+        except Exception:
+            pass
+        time.sleep(0.15)
 
 
 def format_preopen_summary_v22():
@@ -491,7 +520,7 @@ def intraday_monitor_v22():
         open_pct = quote.get("open_pct")
         day_high = quote.get("day_high") or current
         prev_high = stock.get("prev_high") or legacy.get_prev_day_high(code, stock.get("market"))
-        resistance_line = min(stock["watch_line"], prev_high) if prev_high else stock["watch_line"]
+        resistance_line = resistance_for_stock(stock, prev_high)
 
         # PRICE FIRST: if the session has already taken out the weaker resistance,
         # the mentor's "weakness" premise is gone.
@@ -705,7 +734,7 @@ def format_report_v22(candidates):
         blue = max(1, int(c.get("safe_open_volume") or c["vol"] * SAFE_OPEN_VOL_PCT))
         red = c.get("prev_open_volume")
         red_text = f"{red:,}張" if red else "無資料"
-        weak_line = min(c["watch_line"], c.get("prev_high") or c["watch_line"])
+        weak_line = resistance_for_stock(c, c.get("prev_high"))
         notes = "、".join(c.get("daily_notes", [])) or "一般量價候選"
         limit_tag = "｜🔒前日鎖漲停" if c.get("limit_up_locked") else "｜⚠️前日漲停失敗" if c.get("limit_up_failed") else ""
         lines.append(
@@ -740,7 +769,7 @@ def format_line_morning_v22(candidates):
         lines.append(
             f"\n{'🔴' if c.get('strategy_score',0)>=6 else '🟠'} {c['code']} {c['name']}｜{limit_tag}\n"
             f"昨收 {c['close']} {c['pct']:+.2f}%｜量比 {c.get('rel_vol',0):.1f}x\n"
-            f"🟢弱勢線 {min(c['watch_line'], c.get('prev_high') or c['watch_line'])}\n"
+            f"🟢弱勢線 {resistance_for_stock(c, c.get('prev_high'))}\n"
             f"🔵安全量≤{blue:,}｜🔴前日第一盤 {red_text}\n"
             f"看：試撮弱 → 第一盤量縮 → 不過昨高/+2.5% → 破開盤/小拉不過"
         )
