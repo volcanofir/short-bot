@@ -681,6 +681,11 @@ def intraday_monitor_v22():
             if vol_state.get("prev_red")
             else "  🔴 前日實際第一盤：無資料\n"
         )
+        price_rule_text = (
+            f"鎖漲停特殊：+2.5% {stock['watch_line']} 為上方門檻"
+            if stock.get("limit_up_locked")
+            else f"昨高 {prev_high or 'N/A'} / +2.5% {stock['watch_line']} 取低"
+        )
         alert = (
             f"🚨 <b>{grade}級短空候選｜V2.2｜{now.strftime('%H:%M')}</b>\n\n"
             f"<b>{code} {stock['name']}</b> [{stock['market']}]｜分數 <b>{score}</b>\n"
@@ -690,7 +695,7 @@ def intraday_monitor_v22():
             f"  🧭 日線：{daily_text}\n"
             f"  🧪 試撮：{trial_text}\n"
             f"  📍 現價：<b>{current}</b>（{pct_now:+.2f}%）｜開盤 {open_text}\n"
-            f"  🟢 價格弱勢線：<b>{resistance_line}</b>（昨高 {prev_high or 'N/A'} / +2.5% {stock['watch_line']} 取低）\n"
+            f"  🟢 價格弱勢線：<b>{resistance_line}</b>（{price_rule_text}）\n"
             f"  🔵 安全第一盤量：≤{vol_state['safe_blue']:,}張\n"
             f"{red_line}"
         )
@@ -735,13 +740,18 @@ def format_report_v22(candidates):
         red = c.get("prev_open_volume")
         red_text = f"{red:,}張" if red else "無資料"
         weak_line = resistance_for_stock(c, c.get("prev_high"))
+        weak_rule = (
+            f"鎖漲停特殊：+2.5% {c['watch_line']}"
+            if c.get("limit_up_locked")
+            else f"昨高 {c.get('prev_high')} / +2.5% {c['watch_line']} 取低"
+        )
         notes = "、".join(c.get("daily_notes", [])) or "一般量價候選"
         limit_tag = "｜🔒前日鎖漲停" if c.get("limit_up_locked") else "｜⚠️前日漲停失敗" if c.get("limit_up_failed") else ""
         lines.append(
             f"\n{c['signal']} <b>{c['code']} {c['name']}</b>｜{c.get('strategy_type','')}{limit_tag}\n"
             f"  收 {c['close']}｜{c['pct']:+.2f}%｜{c['vol']:,}張｜5日量比 <b>{c.get('rel_vol',0):.1f}x</b>\n"
             f"  3日 {c.get('three_day_gain',0):+.1f}%｜MA5乖離 {c.get('sma5_extension',0):+.1f}%｜{notes}\n"
-            f"  🟢價格弱勢線：<b>{weak_line}</b>（昨高 {c.get('prev_high')} / +2.5% {c['watch_line']} 取低）\n"
+            f"  🟢價格弱勢線：<b>{weak_line}</b>（{weak_rule}）\n"
             f"  🔵第一盤安全量：≤<b>{blue:,}</b>張（昨總量×2%）\n"
             f"  🔴前日實際第一盤：<b>{red_text}</b>\n"
             f"  Scalp參考：{c['scalp_2']} / {c['scalp_3']} / {c['scalp_5']}｜2R {c['target_2r']}"
