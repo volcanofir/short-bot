@@ -3,7 +3,8 @@ services:
     name: short-bot
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn strategy_v2:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120
+    startCommand: gunicorn runtime_v2:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120
+    healthCheckPath: /runtime-status
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
