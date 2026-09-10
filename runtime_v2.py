@@ -1,6 +1,6 @@
-"""Production runtime shim for Short-bot V2.3.
+"""Production runtime shim for Short-bot V2.4.
 
-Runs the mentor-note V2.3 strategy while preserving the precise 09:00~10:00
+Runs the mentor-note V2.4 strategy while preserving the precise 09:00~10:00
 scan driver and duplicate-scan guard.
 """
 
@@ -8,7 +8,7 @@ import time
 import threading
 from datetime import datetime
 
-import strategy_v23 as v2
+import strategy_v24 as v2
 
 app = v2.app
 legacy = v2.legacy
@@ -41,7 +41,7 @@ def guarded_intraday_monitor():
         _last_scan_text = now.isoformat()
         _base_intraday_monitor()
     except Exception as exc:
-        logger.error("V2.3 guarded intraday scan error: %s", exc)
+        logger.error("V2.4 guarded intraday scan error: %s", exc)
     finally:
         _scan_lock.release()
 
@@ -50,7 +50,7 @@ legacy.intraday_monitor = guarded_intraday_monitor
 
 
 def precise_intraday_loop():
-    logger.info("V2.3 precise intraday loop started")
+    logger.info("V2.4 precise intraday loop started")
     next_due = 0.0
     while True:
         try:
@@ -70,23 +70,23 @@ def precise_intraday_loop():
                 next_due = 0.0
                 time.sleep(30)
         except Exception as exc:
-            logger.error("V2.3 precise loop error: %s", exc)
+            logger.error("V2.4 precise loop error: %s", exc)
             time.sleep(5)
 
 
 def runtime_status_text():
     now = datetime.now(TW_TZ)
     return (
-        f"🧭 <b>Short-bot V2.3 Runtime</b>\n"
+        f"🧭 <b>Short-bot V2.4 Runtime</b>\n"
         f"時間：{now.strftime('%m/%d %H:%M:%S')}\n"
         f"最後精準掃描：{_last_scan_text or '尚未執行'}\n"
         f"觀察名單：{len(legacy._watchlist_today)} 支\n"
         f"今日已提醒：{len(legacy._alerted_today)} 支\n"
         f"試撮紀錄：{len(v2._trial_history)} 支\n"
         f"五檔紀錄：{len(v2._book_history)} 支\n"
-        f"第一盤量快取：{len(v2._first_bar_cache)} 筆\n"
+        f"開盤首筆紀錄：{len(v2._open_store)} 筆\n"
         f"股票母池：{len(legacy.SYMBOLS)} 支\n"
-        "規則：昨高/+2.5%雙壓力＋2/1.6/1.4%三級量＋Fugle紅字＋厚委買失守\n"
+        "規則：昨高/+2.5%雙壓力＋2/1.6/1.4%三級量＋開盤首筆紅字＋乖離6%等待＋厚委買失守\n"
         "模式：只提醒，不自動下單"
     )
 
@@ -101,10 +101,10 @@ def handle_update_runtime(update):
     if text in ["/trial", "試撮"] and chat_id:
         legacy.last_update_id = update_id
         try:
-            v2.preopen_scan_once_v23()
+            v2.preopen_scan_once_v24()
         except Exception as exc:
-            logger.info("manual V2.3 trial scan: %s", exc)
-        legacy.tg_only(chat_id, v2.format_preopen_summary_v23())
+            logger.info("manual V2.4 trial scan: %s", exc)
+        legacy.tg_only(chat_id, v2.format_preopen_summary_v24())
         return
     if text in ["/status", "狀態"] and chat_id:
         legacy.last_update_id = update_id
@@ -120,21 +120,30 @@ legacy.handle_update = handle_update_runtime
 def runtime_status():
     return {
         "status": "ok",
-        "version": "2.3-runtime",
+        "version": "2.4-runtime",
         "mode": "alerts_only",
         "last_precise_scan": _last_scan_text,
         "watchlist": len(legacy._watchlist_today),
         "alerted_today": len(legacy._alerted_today),
         "trial_symbols": len(v2._trial_history),
         "book_symbols": len(v2._book_history),
-        "first_bar_cache": len(v2._first_bar_cache),
+        "open_auction_store": len(v2._open_store),
         "symbols": len(legacy.SYMBOLS),
-        "safe_tiers": [v2.SAFE_OPEN_NORMAL_PCT, v2.SAFE_OPEN_PROTECT_PCT, v2.SAFE_OPEN_STRICT_PCT],
-        "red_open_volume_source": "fugle_then_yahoo",
+        "safe_tiers": [
+            v2.SAFE_OPEN_NORMAL_PCT,
+            v2.SAFE_OPEN_PROTECT_PCT,
+            v2.SAFE_OPEN_STRICT_PCT,
+        ],
+        "red_open_volume_source": "fugle_first_official_trade_then_1m_fallback",
         "price_gate": "prior_high_and_plus_2_5_independent",
+        "extreme_gain_wait_pct": v2.EXTREME_GAIN_WAIT_PCT,
         "time": datetime.now(TW_TZ).isoformat(),
     }
 
 
-threading.Thread(target=precise_intraday_loop, daemon=True, name="v23-precise-intraday").start()
-logger.info("Short-bot V2.3 production runtime loaded")
+threading.Thread(
+    target=precise_intraday_loop,
+    daemon=True,
+    name="v24-precise-intraday",
+).start()
+logger.info("Short-bot V2.4 production runtime loaded")
