@@ -257,11 +257,11 @@ v22._today_first_bar = _today_open_auction_v24
 
 
 def _is_extreme_ma5(stock) -> bool:
+    # The notebook only says "5日乖離過大" but does not give a new numeric
+    # threshold. Reuse the strategy's explicit 連漲乖離 classification instead
+    # of inventing a broader cutoff.
     types = stock.get("strategy_types", []) or []
-    return (
-        "連漲乖離" in types
-        or float(stock.get("sma5_extension") or 0) >= float(v21.SMA5_EXTENSION_MIN)
-    )
+    return "連漲乖離" in types
 
 
 def intraday_monitor_v24():
