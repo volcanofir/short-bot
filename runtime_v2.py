@@ -12,7 +12,7 @@ import time
 import threading
 from datetime import datetime
 
-import strategy_v26 as v2
+import strategy_v26_hotfix as v2
 
 app = v2.app
 legacy = v2.legacy
