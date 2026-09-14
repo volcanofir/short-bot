@@ -1,6 +1,8 @@
-"""Production runtime shim for Short-bot V2.5.
+"""Production runtime shim for Short-bot V2.6.
 
-Runs the mentor-note/post-trade V2.5 strategy with:
+Runs the V2.6 strategy with:
+- dynamic TWSE/TPEx all-market prefilter before the historical deep scan
+- locked-limit A/B setup handling
 - 09:00~09:15: 30-second scans
 - 09:15~10:00: 60-second scans
 - 10:00~11:30: 120-second secondary rebound/re-entry scans
@@ -10,7 +12,7 @@ import time
 import threading
 from datetime import datetime
 
-import strategy_v25 as v2
+import strategy_v26 as v2
 
 app = v2.app
 legacy = v2.legacy
@@ -48,7 +50,7 @@ def guarded_intraday_monitor():
         _last_scan_text = now.isoformat()
         _base_intraday_monitor()
     except Exception as exc:
-        logger.error("V2.5 guarded intraday scan error: %s", exc)
+        logger.error("V2.6 guarded intraday scan error: %s", exc)
     finally:
         _scan_lock.release()
 
@@ -57,7 +59,7 @@ legacy.intraday_monitor = guarded_intraday_monitor
 
 
 def precise_intraday_loop():
-    logger.info("V2.5 precise intraday loop started")
+    logger.info("V2.6 precise intraday loop started")
     next_due = 0.0
     while True:
         try:
@@ -82,14 +84,15 @@ def precise_intraday_loop():
                 next_due = 0.0
                 time.sleep(30)
         except Exception as exc:
-            logger.error("V2.5 precise loop error: %s", exc)
+            logger.error("V2.6 precise loop error: %s", exc)
             time.sleep(5)
 
 
 def runtime_status_text():
     now = datetime.now(TW_TZ)
+    stats = v2._market_stats
     return (
-        f"🧭 <b>Short-bot V2.5 Runtime</b>\n"
+        f"🧭 <b>Short-bot V2.6 Runtime</b>\n"
         f"時間：{now.strftime('%m/%d %H:%M:%S')}\n"
         f"最後精準掃描：{_last_scan_text or '尚未執行'}\n"
         f"觀察名單：{len(legacy._watchlist_today)} 支\n"
@@ -97,8 +100,11 @@ def runtime_status_text():
         f"試撮紀錄：{len(v2._trial_history)} 支\n"
         f"五檔紀錄：{len(v2._book_history)} 支\n"
         f"開盤首筆紀錄：{len(v2._open_store)} 筆\n"
-        f"股票母池：{len(legacy.SYMBOLS)} 支\n"
+        f"全市場快照：{stats.get('all_rows', 0)} 支\n"
+        f"動態第一階段：{stats.get('eligible_rows', 0)} 支\n"
+        f"歷史深篩母池：{stats.get('prefilter_symbols', len(legacy.SYMBOLS))} 支\n"
         f"結構停損上限：{v2.MAX_STRUCTURAL_RISK_PCT:g}%\n"
+        f"鎖漲停B級上限：+{v2.LOCKED_B_MAX_PCT:g}%\n"
         f"每股最多提醒：{v2.MAX_ALERTS_PER_SYMBOL} 次\n"
         "時段：09:00~10:00主策略；10:00~11:30弱勢反彈/二次進場\n"
         "模式：只提醒，不自動下單"
@@ -115,10 +121,10 @@ def handle_update_runtime(update):
     if text in ["/trial", "試撮"] and chat_id:
         legacy.last_update_id = update_id
         try:
-            v2.preopen_scan_once_v25()
+            v2.preopen_scan_once_v26()
         except Exception as exc:
-            logger.info("manual V2.5 trial scan: %s", exc)
-        legacy.tg_only(chat_id, v2.format_preopen_summary_v25())
+            logger.info("manual V2.6 trial scan: %s", exc)
+        legacy.tg_only(chat_id, v2.format_preopen_summary_v26())
         return
     if text in ["/status", "狀態"] and chat_id:
         legacy.last_update_id = update_id
@@ -134,7 +140,7 @@ legacy.handle_update = handle_update_runtime
 def runtime_status():
     return {
         "status": "ok",
-        "version": "2.5-runtime",
+        "version": "2.6-runtime",
         "mode": "alerts_only",
         "last_precise_scan": _last_scan_text,
         "watchlist": len(legacy._watchlist_today),
@@ -142,13 +148,14 @@ def runtime_status():
         "trial_symbols": len(v2._trial_history),
         "book_symbols": len(v2._book_history),
         "open_auction_store": len(v2._open_store),
-        "symbols": len(legacy.SYMBOLS),
+        "dynamic_market": dict(v2._market_stats),
+        "dynamic_max_symbols": v2.DYNAMIC_MAX_SYMBOLS,
+        "dynamic_min_volume": v2.DYNAMIC_MIN_VOLUME,
+        "locked_b_max_pct": v2.LOCKED_B_MAX_PCT,
         "max_structural_risk_pct": v2.MAX_STRUCTURAL_RISK_PCT,
         "max_alerts_per_symbol": v2.MAX_ALERTS_PER_SYMBOL,
         "primary_end": "10:00",
         "secondary_end": "11:30",
-        "rebound_min_drop_pct": v2.REBOUND_MIN_DROP_PCT,
-        "rebound_min_bounce_pct": v2.REBOUND_MIN_BOUNCE_PCT,
         "time": datetime.now(TW_TZ).isoformat(),
     }
 
@@ -156,6 +163,6 @@ def runtime_status():
 threading.Thread(
     target=precise_intraday_loop,
     daemon=True,
-    name="v25-precise-intraday",
+    name="v26-precise-intraday",
 ).start()
-logger.info("Short-bot V2.5 production runtime loaded")
+logger.info("Short-bot V2.6 production runtime loaded")
