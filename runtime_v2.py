@@ -151,7 +151,7 @@ legacy.handle_update = handle_update_runtime
 def runtime_status():
     return {
         "status": "ok",
-        "version": "2.6-runtime",
+        "version": "2.7-runtime",
         "mode": "alerts_only",
         "last_precise_scan": _last_scan_text,
         "watchlist": len(legacy._watchlist_today),
@@ -166,6 +166,7 @@ def runtime_status():
         "broker_inventory_enabled": bool(legacy.FINMIND_TOKEN),
         "broker_lookback_calendar_days": v2.BROKER_LOOKBACK_CAL_DAYS,
         "broker_top_n": v2.BROKER_TOP_N,
+        "broker_cache_symbols": len({k[0] for k, item in v2._broker_cache.items() if item.get("value", {}).get("available")}),
         "max_structural_risk_pct": v2.MAX_STRUCTURAL_RISK_PCT,
         "max_alerts_per_symbol": v2.MAX_ALERTS_PER_SYMBOL,
         "primary_end": "10:00",
