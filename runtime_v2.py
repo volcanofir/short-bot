@@ -1,6 +1,6 @@
-"""Production runtime shim for Short-bot V2.8.
+"""Production runtime shim for Short-bot V2.9.
 
-Runs the V2.8 strategy with:
+Runs the V2.9 strategy with:
 - dynamic TWSE/TPEx all-market prefilter before the historical deep scan
 - locked-limit A/B setup handling
 - 09:00~09:15: 30-second scans
@@ -12,7 +12,7 @@ import time
 import threading
 from datetime import datetime
 
-import strategy_v28 as v2
+import strategy_v29 as v2
 
 app = v2.app
 legacy = v2.legacy
@@ -50,7 +50,7 @@ def guarded_intraday_monitor():
         _last_scan_text = now.isoformat()
         _base_intraday_monitor()
     except Exception as exc:
-        logger.error("V2.8 guarded intraday scan error: %s", exc)
+        logger.error("V2.9 guarded intraday scan error: %s", exc)
     finally:
         _scan_lock.release()
 
@@ -59,7 +59,7 @@ legacy.intraday_monitor = guarded_intraday_monitor
 
 
 def precise_intraday_loop():
-    logger.info("V2.8 precise intraday loop started")
+    logger.info("V2.9 precise intraday loop started")
     next_due = 0.0
     while True:
         try:
@@ -84,7 +84,7 @@ def precise_intraday_loop():
                 next_due = 0.0
                 time.sleep(30)
         except Exception as exc:
-            logger.error("V2.8 precise loop error: %s", exc)
+            logger.error("V2.9 precise loop error: %s", exc)
             time.sleep(5)
 
 
@@ -92,7 +92,7 @@ def runtime_status_text():
     now = datetime.now(TW_TZ)
     stats = v2._market_stats
     return (
-        f"🧭 <b>Short-bot V2.8 Runtime</b>\n"
+        f"🧭 <b>Short-bot V2.9 Runtime</b>\n"
         f"時間：{now.strftime('%m/%d %H:%M:%S')}\n"
         f"最後精準掃描：{_last_scan_text or '尚未執行'}\n"
         f"觀察名單：{len(legacy._watchlist_today)} 支\n"
@@ -109,7 +109,8 @@ def runtime_status_text():
         f"分點籌碼：{'已啟用' if legacy.FINMIND_TOKEN else '未啟用'}｜近1/3/5日\n"
         f"乖離過大等待線：+{v2.EXTREME_GAIN_WAIT_PCT:g}%\n"
         f"處置股排除：{v2._disposal_stats.get('active', 0)} 支\n"
-        "指令：/brokers 分點；/broker 6226 單股；/disposals 處置\n"
+        f"2日籌碼分類：{v2._chip2_stats.get('classified', {})}\n"
+        "指令：/brokers 全分點；/broker 6226 單股；/chips2 二日；/chip2 6226；/disposals 處置\n"
         "時段：09:00~10:00主策略；10:00~11:30弱勢反彈/二次進場\n"
         "模式：只提醒，不自動下單"
     )
@@ -125,10 +126,10 @@ def handle_update_runtime(update):
     if text in ["/trial", "試撮"] and chat_id:
         legacy.last_update_id = update_id
         try:
-            v2.preopen_scan_once_v28()
+            v2.preopen_scan_once_v29()
         except Exception as exc:
-            logger.info("manual V2.8 trial scan: %s", exc)
-        legacy.tg_only(chat_id, v2.format_preopen_summary_v28())
+            logger.info("manual V2.9 trial scan: %s", exc)
+        legacy.tg_only(chat_id, v2.format_preopen_summary_v29())
         return
     if text in ["/status", "狀態"] and chat_id:
         legacy.last_update_id = update_id
@@ -136,16 +137,25 @@ def handle_update_runtime(update):
         return
     if text in ["/brokers", "分點"] and chat_id:
         legacy.last_update_id = update_id
-        legacy.tg_only(chat_id, v2.v27.format_broker_watchlist_v27())
+        legacy.tg_only(chat_id, v2.format_broker_watchlist_v29())
         return
     if chat_id and (text.startswith("/broker ") or text.startswith("分點 ")):
         legacy.last_update_id = update_id
         code = text.split(maxsplit=1)[1].strip()
-        legacy.tg_only(chat_id, v2.v27.format_broker_detail_v27(code))
+        legacy.tg_only(chat_id, v2.format_broker_detail_v29(code))
+        return
+    if text in ["/chips2", "2日籌碼", "二日籌碼"] and chat_id:
+        legacy.last_update_id = update_id
+        legacy.tg_only(chat_id, v2.format_chip2_watchlist_v29())
+        return
+    if chat_id and (text.startswith("/chip2 ") or text.startswith("2日籌碼 ") or text.startswith("二日籌碼 ")):
+        legacy.last_update_id = update_id
+        code = text.split(maxsplit=1)[1].strip()
+        legacy.tg_only(chat_id, v2.format_chip2_detail_v29(code))
         return
     if text in ["/disposals", "處置"] and chat_id:
         legacy.last_update_id = update_id
-        legacy.tg_only(chat_id, v2.format_disposal_status_v28())
+        legacy.tg_only(chat_id, v2.v28.format_disposal_status_v28())
         return
     _base_handle_update(update)
 
@@ -157,7 +167,7 @@ legacy.handle_update = handle_update_runtime
 def runtime_status():
     return {
         "status": "ok",
-        "version": "2.8-runtime",
+        "version": "2.9-runtime",
         "mode": "alerts_only",
         "last_precise_scan": _last_scan_text,
         "watchlist": len(legacy._watchlist_today),
@@ -175,6 +185,11 @@ def runtime_status():
         "broker_cache_symbols": len({k[0] for k, item in v2._broker_cache.items() if item.get("value", {}).get("available")}),
         "extreme_gain_wait_pct": v2.EXTREME_GAIN_WAIT_PCT,
         "disposal": dict(v2._disposal_stats),
+        "broker_2d": dict(v2._chip2_stats),
+        "chip2_big_min_lots": v2.CHIP2_BIG_MIN_LOTS,
+        "chip2_big_prev_volume_pct": v2.CHIP2_BIG_PREV_VOL_PCT,
+        "chip2_major_top_n": v2.CHIP2_MAJOR_TOP_N,
+        "chip2_chaos_score_min": v2.CHIP2_CHAOS_SCORE_MIN,
         "max_structural_risk_pct": v2.MAX_STRUCTURAL_RISK_PCT,
         "max_alerts_per_symbol": v2.MAX_ALERTS_PER_SYMBOL,
         "primary_end": "10:00",
@@ -186,6 +201,6 @@ def runtime_status():
 threading.Thread(
     target=precise_intraday_loop,
     daemon=True,
-    name="v28-precise-intraday",
+    name="v29-precise-intraday",
 ).start()
-logger.info("Short-bot V2.8 production runtime loaded")
+logger.info("Short-bot V2.9 production runtime loaded")
