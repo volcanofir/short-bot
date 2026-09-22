@@ -1,49 +1,120 @@
 # Short Bot Dashboard
 
-Static, read-only Traditional Chinese dashboard. Pages source: `dashboard` branch, `/docs` folder. The default `main` branch and all Python/Render files remain unchanged. Do not merge this branch into `main` merely to publish the frontend; that can trigger Render auto-deploy.
+Private, mobile-friendly Traditional Chinese dashboard for `volcanofir/short-bot`.
+
+## Architecture
+
+- **Bot runtime:** Render, `main` branch, `gunicorn runtime_v2:app`
+- **Dashboard frontend:** GitHub Pages, `dashboard` branch, `/docs`
+- **Private data:** Supabase PostgreSQL + Auth + RLS
+- **Strategy:** V2.9 remains alert/paper-analysis only. The dashboard never places orders.
+
+Expected Pages URL: https://volcanofir.github.io/short-bot/
+
+## Authentication
+
+The frontend signs in through Supabase Auth. The approved owner account is authorized by
+`app_metadata.short_bot_role = owner`. Tables keep RLS enabled; anonymous users have no
+read/write access to private dashboard data.
+
+`docs/config.js` contains only public client values:
+
+- Supabase project URL
+- Supabase `sb_publishable_...` key
+- Render public service URL
+
+Never place `service_role`, `sb_secret`, Telegram, LINE, Fugle or FinMind credentials in
+the dashboard branch.
+
+## Data sources
+
+### Bot observation / alert stream
+
+The Render runtime exposes `GET /dashboard-live`.
+
+The endpoint requires a valid Supabase bearer token and checks the authenticated user's
+`short_bot_role`. It returns a sanitized snapshot of:
+
+- current V2.9 watchlist
+- current-day Bot alert records
+- runtime scan status
+
+The browser automatically upserts this feed into:
+
+- `public.dashboard_candidates`
+- `public.dashboard_alerts`
+
+This gives the dashboard a persisted history whenever the owner dashboard is active while
+keeping the Bot itself independent from the Supabase service-role key.
+
+### Actual trades
+
+The owner manually records real fills in `public.dashboard_trades`.
+
+Supported actions:
+
+- create actual entry
+- edit entry, quantity, costs and note
+- change an open trade to closed and record exit date/time/price
+- delete an incorrect record
+
+For short trades the database-generated realized P&L is:
+
+`(entry - exit) * quantity - costs`
+
+Open trades have no realized P&L. Performance, win rate, profit factor and drawdown only use
+**closed actual trades**. Bot paper alerts never enter formal performance.
+
+### Shadow Lab
+
+`public.dashboard_experiments` stays separate from actual-trade performance. Shadow samples,
+win rate and P&L are displayed as research results only.
+
+## scan_date rule
+
+The live watchlist's `scan_date` means **the session being monitored**, not the date of the
+previous closing bar used to construct the candidate.
+
+- Before the weekday 13:40 close scan: current Taiwan trading date
+- After the 13:40 close scan: next trading date
+- Weekend: next weekday
+
+This fixes the previous mismatch where a 09:xx live watchlist could appear under the previous
+day because `get_last_trading_day()` describes the source close, not the monitored session.
+
+Bot alerts always use the current Taiwan session date.
+
+## Supabase tables
+
+- `dashboard_candidates` — persisted Bot observation list
+- `dashboard_alerts` — persisted Bot alert records
+- `dashboard_trades` — owner's real trades
+- `dashboard_experiments` — Shadow results
+- `dashboard_snapshots` — retained compatibility snapshot table
+
+All private tables use RLS. Candidate/alert browser sync is allowed only for the authenticated
+owner role. Actual trades are additionally isolated by `owner_id = auth.uid()`.
 
 ## Local verification
 
-Requires Node.js 22 or later for built-in tests, with no package install:
+No package install is required for the existing data-unit tests:
 
 ```sh
 node --test dashboard-tests/data.test.mjs
 ```
 
-Serve `docs/` with any static HTTP server. All asset paths are relative and navigation uses hash routes, so `/short-bot/#trades` works on GitHub Pages without rewrites. Demo data is synthetic and is regenerated relative to the current Taipei date. Demo is off after every reload. No real trading data is published with this frontend.
-
-## Features
-
-- Today: dated candidates, entry count, realized net P&L, closed-trade win rate, 14-day cumulative P&L.
-- Performance: 7/30/90-day period ending on the selected date; closed trades only; profit factor and maximum drawdown in TWD.
-- Trades: 1/7/30/90-day date range, code/name search, status filter, detail dialog and UTF-8 CSV export. Demo exports have DEMO in filename; formula-like fields are escaped.
-- Shadow Lab: dated experiment snapshots, separate synthetic sample counts, win rate and P&L. No activation, order placement or Bot control endpoints.
-- Empty, loading, timeout, invalid-config, malformed-data and stale-snapshot states. Explicit refresh; no polling of Render.
-
-## Supabase contract (reserved, not provisioned)
-
-`docs/config.js` contains only an HTTPS project root URL and `sb_publishable_...` key. Never publish `service_role`, `sb_secret`, Telegram, LINE, Fugle or FinMind credentials. No secrets or actual Supabase project have been provisioned by this change.
-
-The adapter makes one GET to `/rest/v1/dashboard_snapshots?select=payload&order=created_at.desc&limit=1` with an `apikey` header. A future trusted producer must supply a **complete** snapshot for the supported history (at least 90 days for the period selector). The frontend does not infer completeness or query Render. Date filters use entry date; P&L is a cohort summary of trades entered in that interval, not a daily broker settlement ledger. Snapshot producer should document its fee/tax/slippage model.
-
-Expected relation columns: `created_at timestamptz` and `payload jsonb`. The payload schema is validated by `validateSnapshot` in `docs/data.mjs`. Example shape:
-
-```json
-{
-  "schema_version": 1,
-  "generated_at": "2026-09-23T03:00:00Z",
-  "candidates": [{"date":"2026-09-23","code":"EXAMPLE","name":"Example","strategy":"V2.9","price":100,"change":-1.2,"setup":"反彈轉弱","chip":"集中","score":7,"status":"觀察中"}],
-  "trades": [{"id":"unique-id","date":"2026-09-23","time":"09:25","code":"EXAMPLE","name":"Example","strategy":"V2.9","status":"closed","entry":100,"exit":99,"quantity":1000,"pnl":850,"note":"Synthetic example, not a real trade"}],
-  "experiments": [{"id":"SH-001","date":"2026-09-23","strategy":"V2.9","name":"Example","description":"Synthetic example","status":"模擬觀察","samples":10,"win_rate":60,"pnl":100}]
-}
-```
-
-Dates/times represent Asia/Taipei. `generated_at` must have an ISO timestamp with offset. Closed trades require numeric `exit` and net `pnl`; open trades may have null values. Experiment `win_rate` is 0–100 or null. Empty arrays represent no records; missing connection is not shown as zero performance. Render health is deliberately unverified.
-
-Before enabling a project: enable RLS, grant only SELECT, and configure an explicit policy for approved public/sanitized dashboard snapshots. Supabase now requires explicit Data API grants for new tables. A public anonymous read policy exposes the approved snapshot to everyone; do not place private trading/account data in that snapshot. For private data, add Supabase Auth and per-user RLS before connecting. Do not disable RLS to make the UI work. This change provides no SQL migration or live database changes.
-
-See [Supabase data security](https://supabase.com/docs/guides/database/secure-data) and [GitHub Pages source configuration](https://docs.github.com/en/pages/getting-started-with-github-pages/configuring-a-publishing-source-for-your-github-pages-site).
+Serve `docs/` with a static HTTP server for UI testing. Hash routing keeps GitHub Pages
+compatible without rewrites.
 
 ## Deployment / rollback
 
-GitHub Settings → Pages → Deploy from a branch → `dashboard` → `/docs` → Save. GitHub's built-in Pages workflow deploys this static folder; no workflow secret is needed. Expected URL: https://volcanofir.github.io/short-bot/ . Keep Render's existing source branch and settings untouched. Later dashboard updates should only modify frontend files on `dashboard`. To roll back, revert the frontend commit on that branch, or disable Pages; neither changes `main` or the Bot.
+GitHub Pages should publish from:
+
+- Branch: `dashboard`
+- Folder: `/docs`
+
+Render remains on `main`. The dashboard branch must not be merged into `main` merely to
+publish the frontend.
+
+To roll back the frontend, revert the relevant dashboard-branch commit. To roll back the Bot
+feed, revert the `runtime_v2.py` commit on `main`.
