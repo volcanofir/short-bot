@@ -142,6 +142,37 @@ const dateString = value => {
 };
 export const offsetDate = (date, days) => dateString(new Date(toDate(date).getTime() + days * 86400000));
 
+async function registerBotIngest(config, session) {
+  if (!config?.renderUrl) return session;
+  const active = await refreshSession(config, session);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 12000);
+  try {
+    const response = await fetch(new URL('/dashboard-bot-auth', config.renderUrl), {
+      headers: { Authorization: `Bearer ${active.access_token}` },
+      cache: 'no-store',
+      signal: controller.signal,
+    });
+    const data = await json(response);
+    if (!/^[0-9a-f]{64}$/.test(data?.token_sha256 || '')) {
+      throw new Error('Bot 同步驗證資料格式不正確');
+    }
+    const result = await supabase(
+      config,
+      active,
+      'dashboard_ingest_auth?on_conflict=id',
+      {
+        method: 'POST',
+        headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
+        body: { id: 1, bot_token_sha256: data.token_sha256, updated_at: new Date().toISOString() },
+      },
+    );
+    return result.session;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function fetchLive(config, session) {
   if (!config?.renderUrl) return null;
   const active = await refreshSession(config, session);
@@ -195,14 +226,23 @@ export async function loadDashboard(config, date, session = loadSession()) {
   let liveError = '';
 
   try {
+    active = await registerBotIngest(config, active);
+  } catch (error) {
+    liveError = error?.name === 'AbortError'
+      ? 'Bot 背景同步驗證逾時'
+      : (error?.message || 'Bot 背景同步驗證失敗');
+  }
+
+  try {
     const result = await fetchLive(config, active);
     live = result?.data || null;
     active = result?.session || active;
     active = await syncLiveRows(config, active, live);
   } catch (error) {
-    liveError = error?.name === 'AbortError'
+    const message = error?.name === 'AbortError'
       ? 'Render 即時資料逾時'
       : (error?.message || 'Render 即時資料讀取失敗');
+    liveError = [liveError, message].filter(Boolean).join('；');
   }
 
   const start = offsetDate(date, -89);
