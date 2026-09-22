@@ -1,7 +1,159 @@
 <!doctype html>
-<html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark"><meta name="description" content="Short Bot V2.9 — 今日監控、策略績效、交易明細與 Shadow Lab"><title>Short Bot · Dashboard</title><link rel="icon" href="./favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="./style.css"></head>
-<body><a class="skip" href="#main">跳至內容</a><aside class="sidebar"><a href="#today" class="brand"><span class="logo">↘</span><span>SHORT BOT<small>TRADING INTELLIGENCE</small></span></a><div class="workspace"><span class="workspace-icon">S</span><span>策略觀測工作台<small>台灣股票市場 · TW</small></span><span class="version">V2.9</span></div><p class="nav-label">WORKSPACE</p><nav aria-label="主要導覽"><a href="#today" data-page="today"><span>◫</span>今日監控</a><a href="#performance" data-page="performance"><span>▥</span>策略績效</a><a href="#trades" data-page="trades"><span>⇄</span>交易明細</a><a href="#shadow" data-page="shadow"><span>◇</span>Shadow Lab <small>LAB</small></a></nav><div class="sidebar-bottom"><div class="bot-card"><span class="dot muted"></span>Render Bot<small>獨立運作 · 狀態未接入</small></div><p>策略版本 <b>V2.9</b></p><p>Dashboard <b>1.0</b></p><a href="https://github.com/volcanofir/short-bot/tree/dashboard" target="_blank" rel="noopener">查看 GitHub ↗</a></div></aside>
-<div class="shell"><header><div class="breadcrumb">工作台 <span>/</span> <b id="crumb">今日監控</b></div><div class="header-right"><span class="timezone">Asia / Taipei</span><span id="source-badge" class="badge">未接入資料</span><span class="avatar">VF</span></div></header><main id="main"><div class="page-heading"><div><p class="eyebrow">SHORT BOT / STRATEGY OBSERVATORY</p><h1 id="page-title">今日監控<span class="title-dot">.</span></h1><p id="page-description" class="description"></p></div><button id="refresh" class="button">↻ 更新資料</button></div>
-<div id="notice" class="notice" role="status" aria-live="polite"></div><div class="toolbar"><div class="filters"><label>觀察日期 <input type="date" id="date"></label><label>策略 <select id="strategy"><option value="all">全部策略</option><option value="V2.9">V2.9 · 二日籌碼</option></select></label></div><label class="demo-switch"><input type="checkbox" id="demo">展示示範資料<span class="switch-track"></span></label></div>
-<section id="view" aria-label="儀表板內容"></section><footer><span><span class="dot"></span> Short Bot Dashboard <span class="footer-separator">/</span> V2.9 preserved</span><span id="updated">尚未同步資料</span></footer></main></div>
-<dialog id="trade-dialog"><div class="dialog-heading"><h2>交易明細</h2><button id="close-dialog" class="icon-button" aria-label="關閉明細">×</button></div><div id="detail"></div></dialog><script src="./config.js"></script><script type="module" src="./app.js"></script></body></html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="description" content="Short Bot V2.9 — 今日監控、實際交易績效與 Shadow Lab">
+  <title>Short Bot · Dashboard</title>
+  <link rel="icon" href="./favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <section id="auth-screen" class="auth-screen">
+    <form id="login-form" class="login-card" autocomplete="on">
+      <div class="login-mark">↘</div>
+      <p class="eyebrow">SHORT BOT / PRIVATE DASHBOARD</p>
+      <h1>策略觀測工作台<span class="title-dot">.</span></h1>
+      <p class="login-copy">登入後才會讀取 Bot 即時觀察、提醒紀錄與你的實際成交資料。</p>
+      <label>帳號
+        <input id="login-email" name="email" type="email" autocomplete="username" required>
+      </label>
+      <label>密碼
+        <input id="login-password" name="password" type="password" autocomplete="current-password" required>
+      </label>
+      <p id="login-error" class="login-error" role="alert"></p>
+      <button id="login-button" class="button primary" type="submit">登入 Dashboard</button>
+      <small>帳號權限由 Supabase Auth + RLS 控制；密碼不會寫入 GitHub。</small>
+    </form>
+  </section>
+
+  <div id="app-root" hidden>
+    <a class="skip" href="#main">跳至內容</a>
+    <aside class="sidebar">
+      <a href="#today" class="brand">
+        <span class="logo">↘</span>
+        <span>SHORT BOT<small>TRADING INTELLIGENCE</small></span>
+      </a>
+      <div class="workspace">
+        <span class="workspace-icon">S</span>
+        <span>策略觀測工作台<small>台灣股票市場 · TW</small></span>
+        <span class="version">V2.9</span>
+      </div>
+      <p class="nav-label">WORKSPACE</p>
+      <nav aria-label="主要導覽">
+        <a href="#today" data-page="today"><span>◫</span>今日監控</a>
+        <a href="#performance" data-page="performance"><span>▥</span>策略績效</a>
+        <a href="#trades" data-page="trades"><span>⇄</span>交易明細</a>
+        <a href="#shadow" data-page="shadow"><span>◇</span>Shadow Lab <small>LAB</small></a>
+      </nav>
+      <div class="sidebar-bottom">
+        <div class="bot-card"><span id="bot-dot" class="dot muted"></span>Render Bot<small id="bot-status">等待同步</small></div>
+        <p>策略版本 <b>V2.9</b></p>
+        <p>Dashboard <b>2.0</b></p>
+        <a href="https://github.com/volcanofir/short-bot/tree/dashboard" target="_blank" rel="noopener">查看 GitHub ↗</a>
+      </div>
+    </aside>
+
+    <div class="shell">
+      <header>
+        <div class="breadcrumb">工作台 <span>/</span> <b id="crumb">今日監控</b></div>
+        <div class="header-right">
+          <span class="timezone">Asia / Taipei</span>
+          <span id="source-badge" class="badge">同步中</span>
+          <span id="user-email" class="user-email"></span>
+          <button id="logout" class="header-button" type="button">登出</button>
+        </div>
+      </header>
+
+      <main id="main">
+        <div class="page-heading">
+          <div>
+            <p class="eyebrow">SHORT BOT / STRATEGY OBSERVATORY</p>
+            <h1 id="page-title">今日監控<span class="title-dot">.</span></h1>
+            <p id="page-description" class="description"></p>
+          </div>
+          <button id="refresh" class="button">↻ 更新資料</button>
+        </div>
+
+        <div id="notice" class="notice" role="status" aria-live="polite"></div>
+        <div class="toolbar">
+          <div class="filters">
+            <label>觀察日期 <input type="date" id="date"></label>
+            <label>策略
+              <select id="strategy">
+                <option value="all">全部策略</option>
+                <option value="V2.9">V2.9 · 二日籌碼</option>
+              </select>
+            </label>
+          </div>
+          <div class="toolbar-actions">
+            <span id="updated" class="updated">尚未同步資料</span>
+            <button id="new-trade" class="button primary" type="button">＋ 新增實際成交</button>
+          </div>
+        </div>
+
+        <section id="view" aria-label="儀表板內容"></section>
+        <footer>
+          <span><span class="dot"></span> Short Bot Dashboard <span class="footer-separator">/</span> V2.9 preserved</span>
+          <span>實際績效只計入已平倉成交；Shadow 獨立呈現</span>
+        </footer>
+      </main>
+    </div>
+
+    <dialog id="trade-dialog">
+      <div class="dialog-heading">
+        <h2>交易明細</h2>
+        <button id="close-dialog" class="icon-button" aria-label="關閉明細">×</button>
+      </div>
+      <div id="detail"></div>
+    </dialog>
+
+    <dialog id="trade-editor">
+      <form id="trade-form" method="dialog">
+        <div class="dialog-heading">
+          <div>
+            <p class="eyebrow">ACTUAL TRADE</p>
+            <h2 id="trade-form-title">新增實際成交</h2>
+          </div>
+          <button id="close-editor" class="icon-button" type="button" aria-label="關閉編輯">×</button>
+        </div>
+        <input type="hidden" id="trade-id">
+        <div class="form-grid">
+          <label>進場日期<input id="trade-date" type="date" required></label>
+          <label>進場時間<input id="trade-time" type="time" required></label>
+          <label>股票代號<input id="trade-code" type="text" maxlength="20" inputmode="numeric" required></label>
+          <label>股票名稱<input id="trade-name" type="text" maxlength="80" required></label>
+          <label>進場價<input id="trade-entry" type="number" step="0.01" min="0.01" required></label>
+          <label>股數<input id="trade-quantity" type="number" step="1" min="1" value="1000" required></label>
+          <label>交易成本<input id="trade-costs" type="number" step="1" min="0" value="0" required></label>
+          <label>狀態
+            <select id="trade-edit-status">
+              <option value="open">未平倉</option>
+              <option value="closed">已平倉</option>
+            </select>
+          </label>
+        </div>
+        <div id="close-fields" class="form-grid close-fields" hidden>
+          <label>平倉日期<input id="trade-exit-date" type="date"></label>
+          <label>平倉時間<input id="trade-exit-time" type="time"></label>
+          <label>出場價<input id="trade-exit" type="number" step="0.01" min="0.01"></label>
+        </div>
+        <label class="note-label">備註
+          <textarea id="trade-note" rows="3" maxlength="1000" placeholder="例如：實際成交原因、手動停損、滑價等"></textarea>
+        </label>
+        <p id="trade-form-error" class="login-error" role="alert"></p>
+        <div class="dialog-actions">
+          <button id="delete-trade" class="button danger" type="button" hidden>刪除</button>
+          <span></span>
+          <button id="cancel-trade" class="button" type="button">取消</button>
+          <button id="save-trade" class="button primary" type="submit">儲存</button>
+        </div>
+      </form>
+    </dialog>
+  </div>
+
+  <script src="./config.js"></script>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
