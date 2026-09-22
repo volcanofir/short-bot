@@ -10,6 +10,8 @@ Runs the V2.9 strategy with:
 
 import time
 import threading
+import hashlib
+import json
 from datetime import datetime, timedelta
 
 import requests
@@ -39,6 +41,8 @@ DASHBOARD_ALLOWED_ORIGINS = {
     "http://localhost:8000",
     "http://127.0.0.1:8000",
 }
+_dashboard_push_lock = threading.Lock()
+_dashboard_last_fingerprint = None
 
 
 def _dashboard_cors(response):
@@ -202,6 +206,7 @@ def guarded_intraday_monitor():
         _last_scan_ts = ts
         _last_scan_text = now.isoformat()
         _base_intraday_monitor()
+        _push_dashboard_snapshot()
     except Exception as exc:
         logger.error("V2.9 guarded intraday scan error: %s", exc)
     finally:
@@ -282,6 +287,7 @@ def handle_update_runtime(update):
             v2.preopen_scan_once_v29()
         except Exception as exc:
             logger.info("manual V2.9 trial scan: %s", exc)
+        _push_dashboard_snapshot(force=True)
         legacy.tg_only(chat_id, v2.format_preopen_summary_v29())
         return
     if text in ["/status", "狀態"] and chat_id:
@@ -314,6 +320,94 @@ def handle_update_runtime(update):
 
 
 legacy.handle_update = handle_update_runtime
+
+
+
+def _push_dashboard_snapshot(force=False):
+    """Persist Bot observations/alerts without storing a new database secret.
+
+    The existing Telegram bot token is sent only over HTTPS to the Supabase RPC.
+    PostgreSQL stores only its SHA-256 hash, which the authenticated owner
+    registers from the private dashboard.
+    """
+    global _dashboard_last_fingerprint
+    if not getattr(legacy, "TG_TOKEN", ""):
+        return False
+    if not _dashboard_push_lock.acquire(blocking=False):
+        return False
+    try:
+        now = datetime.now(TW_TZ)
+        candidates = _dashboard_candidates(now)
+        alerts = _dashboard_alerts(now)
+        if not candidates and not alerts:
+            return False
+
+        payload = {"p_candidates": candidates, "p_alerts": alerts}
+        # Normalize any uncommon numeric/date-like values nested in diagnostic
+        # payloads while preserving the explicit top-level numeric fields.
+        payload = json.loads(json.dumps(payload, ensure_ascii=False, default=str))
+        fingerprint = hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        if not force and fingerprint == _dashboard_last_fingerprint:
+            return True
+
+        r = requests.post(
+            f"{SUPABASE_URL}/rest/v1/rpc/ingest_short_bot",
+            headers={
+                "apikey": SUPABASE_PUBLISHABLE_KEY,
+                "Content-Type": "application/json",
+                "x-short-bot-token": legacy.TG_TOKEN,
+            },
+            json=payload,
+            timeout=10,
+        )
+        if r.status_code in (200, 201, 204):
+            _dashboard_last_fingerprint = fingerprint
+            logger.info(
+                "Dashboard Supabase sync OK: candidates=%s alerts=%s",
+                len(candidates), len(alerts),
+            )
+            return True
+
+        # 401/403 is expected only before the owner dashboard has registered
+        # the Telegram-token hash for secure background ingest.
+        logger.info("Dashboard Supabase sync status=%s", r.status_code)
+        return False
+    except Exception as exc:
+        logger.info("Dashboard Supabase sync error: %s", exc)
+        return False
+    finally:
+        _dashboard_push_lock.release()
+
+
+def dashboard_sync_loop():
+    logger.info("Dashboard Supabase sync loop started")
+    while True:
+        try:
+            _push_dashboard_snapshot()
+        except Exception as exc:
+            logger.info("Dashboard sync loop error: %s", exc)
+        time.sleep(60)
+
+
+@app.route("/dashboard-bot-auth", methods=["GET", "OPTIONS"])
+def dashboard_bot_auth():
+    if request.method == "OPTIONS":
+        return _dashboard_cors(make_response("", 204))
+    if not _dashboard_owner():
+        return _dashboard_cors(
+            make_response(jsonify({"error": "unauthorized"}), 401)
+        )
+    token = getattr(legacy, "TG_TOKEN", "")
+    if not token:
+        return _dashboard_cors(
+            make_response(jsonify({"error": "telegram token unavailable"}), 503)
+        )
+    response = jsonify({
+        "token_sha256": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+    })
+    return _dashboard_cors(response)
 
 
 @app.route("/dashboard-live", methods=["GET", "OPTIONS"])
@@ -385,5 +479,10 @@ threading.Thread(
     target=precise_intraday_loop,
     daemon=True,
     name="v29-precise-intraday",
+).start()
+threading.Thread(
+    target=dashboard_sync_loop,
+    daemon=True,
+    name="dashboard-supabase-sync",
 ).start()
 logger.info("Short-bot V2.9 production runtime loaded")
