@@ -436,6 +436,24 @@ def _chip2_one_line(stock):
     )
 
 
+def format_broker_watchlist_v29():
+    """Combined V2.7 inventory direction + V2.9 two-day structure."""
+    return (
+        v27.format_broker_watchlist_v27()
+        + "\n\n"
+        + format_chip2_watchlist_v29()
+    )
+
+
+def format_broker_detail_v29(code: str):
+    """Combined single-symbol 1/3/5-day inventory and two-day structure."""
+    return (
+        v27.format_broker_detail_v27(code)
+        + "\n\n"
+        + format_chip2_detail_v29(code)
+    )
+
+
 def format_chip2_watchlist_v29():
     items = list(legacy._watchlist_today or [])
     if not items:
