@@ -383,3 +383,9 @@ async function init() {
 }
 
 init();
+
+// Keep the private dashboard in sync while it is open. The loading guard prevents
+// overlapping requests; hidden/background tabs do not poll.
+setInterval(() => {
+  if (session && !document.hidden) refreshData();
+}, 60000);
