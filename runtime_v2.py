@@ -10,7 +10,10 @@ Runs the V2.9 strategy with:
 
 import time
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
+
+import requests
+from flask import jsonify, make_response, request
 
 import strategy_v29 as v2
 
@@ -25,6 +28,156 @@ _scan_lock = threading.Lock()
 _last_scan_ts = 0.0
 _last_scan_text = None
 MIN_SCAN_GAP_SECONDS = 20
+
+# Public Supabase connection information used only to validate the dashboard
+# owner's access token. The publishable key is intentionally safe for clients;
+# no service-role or secret key is stored in this repository.
+SUPABASE_URL = "https://ebamqlnchakpwyuxzmnk.supabase.co"
+SUPABASE_PUBLISHABLE_KEY = "sb_publishable_38LhI3s8eZNKkfMz4ID98A_JgR2SpJR"
+DASHBOARD_ALLOWED_ORIGINS = {
+    "https://volcanofir.github.io",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+}
+
+
+def _dashboard_cors(response):
+    origin = request.headers.get("Origin", "")
+    if origin in DASHBOARD_ALLOWED_ORIGINS:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Vary"] = "Origin"
+    response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type"
+    response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+def _dashboard_owner():
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return None
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/auth/v1/user",
+            headers={
+                "apikey": SUPABASE_PUBLISHABLE_KEY,
+                "Authorization": auth,
+            },
+            timeout=6,
+        )
+        if r.status_code != 200:
+            return None
+        user = r.json() or {}
+        if (user.get("app_metadata") or {}).get("short_bot_role") != "owner":
+            return None
+        return user
+    except Exception as exc:
+        logger.info("dashboard auth check failed: %s", exc)
+        return None
+
+
+def _next_weekday(day):
+    result = day
+    while result.weekday() >= 5:
+        result += timedelta(days=1)
+    return result
+
+
+def dashboard_candidate_scan_date(now=None):
+    """Date represented by the in-memory watchlist.
+
+    Before the 13:40 close scan, the watchlist belongs to the current session.
+    After the 13:40 close scan (and on weekends), it belongs to the next
+    trading session. This avoids the old get_last_trading_day() mismatch that
+    made a live 09:xx dashboard appear under the previous date.
+    """
+    now = now or datetime.now(TW_TZ)
+    if now.weekday() >= 5:
+        return _next_weekday(now.date())
+    hm = now.hour * 60 + now.minute
+    if hm >= 13 * 60 + 40:
+        return legacy.get_next_trading_day(now.date())
+    return now.date()
+
+
+def _dashboard_candidates(now):
+    scan_date = dashboard_candidate_scan_date(now)
+    rows = []
+    alerted = {str(x) for x in legacy._alerted_today}
+    for stock in list(legacy._watchlist_today or []):
+        code = str(stock.get("code") or "").strip()
+        price = stock.get("close") or stock.get("current") or stock.get("entry")
+        if not code or price in (None, 0):
+            continue
+        chip2 = stock.get("broker_2d") or {}
+        rows.append({
+            "scan_date": scan_date.isoformat(),
+            "scan_time": now.strftime("%H:%M"),
+            "code": code,
+            "name": str(stock.get("name") or legacy.STOCK_NAMES.get(code, code)),
+            "strategy": "V2.9",
+            "price": float(price),
+            "change": float(stock.get("pct") or 0),
+            "setup": str(stock.get("strategy_type") or stock.get("setup") or "量價候選"),
+            "chip": str(chip2.get("classification") or "資料不足"),
+            "score": float(stock.get("strategy_score") or stock.get("score") or 0),
+            "status": "已提醒" if scan_date == now.date() and code in alerted else "觀察中",
+            "payload": {
+                "market": stock.get("market"),
+                "watch_line": stock.get("watch_line"),
+                "prev_high": stock.get("prev_high"),
+                "rel_vol": stock.get("rel_vol"),
+                "broker_2d": {
+                    "classification": chip2.get("classification"),
+                    "top1_concentration_pct": chip2.get("top1_concentration_pct"),
+                    "top3_concentration_pct": chip2.get("top3_concentration_pct"),
+                    "major_buyer_overlap_pct": chip2.get("major_buyer_overlap_pct"),
+                    "flip_to_sell_count": chip2.get("flip_to_sell_count"),
+                    "high_turnover_share_pct": chip2.get("high_turnover_share_pct"),
+                },
+            },
+        })
+    return rows
+
+
+def _dashboard_alerts(now):
+    rows = []
+    counters = {}
+    session_date = now.date().isoformat()
+    for trade in list(legacy._today_trades or []):
+        code = str(trade.get("code") or "").strip()
+        time_text = str(trade.get("time") or now.strftime("%H:%M"))[:5]
+        if not code or trade.get("entry") in (None, 0):
+            continue
+        key = (code, time_text)
+        counters[key] = counters.get(key, 0) + 1
+        alert_id = f"{session_date}:{code}:{time_text}:{counters[key]}"
+        rows.append({
+            "id": alert_id,
+            "scan_date": session_date,
+            "alert_time": time_text,
+            "code": code,
+            "name": str(trade.get("name") or legacy.STOCK_NAMES.get(code, code)),
+            "strategy": "V2.9",
+            "entry": float(trade.get("entry")),
+            "stop": float(trade.get("stop") or trade.get("entry")),
+            "target": float(trade.get("target_2r") or trade.get("target") or trade.get("entry")),
+            "score": float(trade.get("score") or 0),
+            "grade": str(trade.get("grade") or ""),
+            "setup": str(trade.get("setup") or trade.get("strategy_type") or ""),
+            "reentry": bool(trade.get("reentry")),
+            "payload": {
+                "market": trade.get("market"),
+                "target_scalp": trade.get("target_scalp"),
+                "scalp_2": trade.get("scalp_2"),
+                "scalp_3": trade.get("scalp_3"),
+                "scalp_5": trade.get("scalp_5"),
+                "watch_line": trade.get("watch_line"),
+                "open_volume_today": trade.get("open_volume_today"),
+                "open_volume_tier": trade.get("open_volume_tier"),
+            },
+        })
+    return rows
 
 
 def _monitor_window(now):
@@ -161,6 +314,36 @@ def handle_update_runtime(update):
 
 
 legacy.handle_update = handle_update_runtime
+
+
+@app.route("/dashboard-live", methods=["GET", "OPTIONS"])
+def dashboard_live():
+    if request.method == "OPTIONS":
+        return _dashboard_cors(make_response("", 204))
+
+    user = _dashboard_owner()
+    if not user:
+        return _dashboard_cors(
+            make_response(jsonify({"error": "unauthorized"}), 401)
+        )
+
+    now = datetime.now(TW_TZ)
+    response = jsonify({
+        "schema_version": 1,
+        "generated_at": now.isoformat(),
+        "candidate_scan_date": dashboard_candidate_scan_date(now).isoformat(),
+        "candidates": _dashboard_candidates(now),
+        "alerts": _dashboard_alerts(now),
+        "runtime": {
+            "version": "2.9-runtime",
+            "last_precise_scan": _last_scan_text,
+            "watchlist": len(legacy._watchlist_today),
+            "alerted_today": len(legacy._alerted_today),
+            "primary_end": "10:00",
+            "secondary_end": "11:30",
+        },
+    })
+    return _dashboard_cors(response)
 
 
 @app.route("/runtime-status")
