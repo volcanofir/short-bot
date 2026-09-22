@@ -39,13 +39,23 @@ The endpoint requires a valid Supabase bearer token and checks the authenticated
 - current-day Bot alert records
 - runtime scan status
 
-The browser automatically upserts this feed into:
+The first successful owner login automatically registers a **SHA-256 hash** of the existing
+Render `TELEGRAM_BOT_TOKEN` in `dashboard_ingest_auth`. The raw token is never stored in
+Supabase or GitHub.
+
+After that bootstrap, Render pushes changed watchlist/alert snapshots directly to the
+`ingest_short_bot` RPC about once per minute and immediately after guarded intraday scans.
+The RPC accepts writes only when the request's existing Telegram token hashes to the registered
+owner value.
+
+Persisted history lives in:
 
 - `public.dashboard_candidates`
 - `public.dashboard_alerts`
 
-This gives the dashboard a persisted history whenever the owner dashboard is active while
-keeping the Bot itself independent from the Supabase service-role key.
+The browser still upserts the current live feed as an immediate fallback, so the first login
+does not have to wait for the next background cycle. No Supabase service-role key is stored on
+Render or in GitHub.
 
 ### Actual trades
 
@@ -90,6 +100,7 @@ Bot alerts always use the current Taiwan session date.
 - `dashboard_alerts` — persisted Bot alert records
 - `dashboard_trades` — owner's real trades
 - `dashboard_experiments` — Shadow results
+- `dashboard_ingest_auth` — one owner-only SHA-256 token fingerprint used for secure Bot ingest
 - `dashboard_snapshots` — retained compatibility snapshot table
 
 All private tables use RLS. Candidate/alert browser sync is allowed only for the authenticated
