@@ -41,10 +41,3 @@ export async function loadSnapshot(config,fetcher=fetch){
  const rows=await response.json();if(!Array.isArray(rows))throw new Error('資料回應格式不正確。');
  return {source:'supabase',snapshot:rows.length?validateSnapshot(rows[0].payload):emptySnapshot()};
 }
-export function demoSnapshot(today=taipeiDate()){
- const names=[['2330','台積電'],['2317','鴻海'],['2454','聯發科'],['3231','緯創'],['2382','廣達'],['2603','長榮']];
- const candidates=names.map(([code,name],i)=>({code,name,date:today,strategy:'V2.9',price:[1040,185.5,1380,112,278,215.5][i],change:[-1.4,-2.1,.8,-1.8,-.6,1.2][i],score:[8,7,6,8,5,4][i],setup:['反彈轉弱','跌破觀察線','等待確認'][i%3],chip:['集中','分散雜亂','普通'][i%3],status:i%3===2?'觀察中':'訊號確認'}));
- const trades=Array.from({length:48},(_,i)=>{const [code,name]=names[i%6],entry=[1040,185.5,1380,112,278,215.5][i%6],pnl=[1850,-1200,2400,900,-800,1600,0,2150][i%8];return {id:`DEMO-${i+1}`,date:offsetDate(today,-Math.floor(i/2)),time:i%2?'10:15':'09:25',code,name,strategy:'V2.9',status:i===0?'open':'closed',entry,exit:i===0?null:Number((entry-pnl/1000).toFixed(2)),quantity:1000,pnl:i===0?null:pnl,note:'此筆為合成示範交易，僅用來測試前台功能，並非 V2.9 真實績效。示範淨損益已包含模擬交易成本。'};});
- const experiments=[{id:'SH-001',name:'二日籌碼延續度',description:'比較主要買方重疊率，觀察籌碼延續對訊號的影響。',samples:86,win_rate:61.6,pnl:12400},{id:'SH-002',name:'分散雜亂加分',description:'比較有效空方型態成立後，加分條件的模擬表現。',samples:64,win_rate:57.8,pnl:8100},{id:'SH-003',name:'次波反彈再進場',description:'觀察 10:00 後反彈轉弱訊號，與主策略獨立記錄。',samples:32,win_rate:53.1,pnl:-1800}].map(e=>({...e,date:today,strategy:'V2.9',status:'模擬觀察'}));
- return {schema_version:1,generated_at:new Date().toISOString(),candidates,trades,experiments};
-}
