@@ -6,6 +6,7 @@ import {
   cumulativeSeries,
   csv,
   emptySnapshot,
+  offsetDate,
 } from './data.mjs';
 import {
   loadSession,
@@ -21,12 +22,14 @@ const config = window.SHORT_BOT_CONFIG ?? {};
 const titles = {
   today: ['今日監控', 'Bot 觀察與提醒自動同步；實際成交由你自行記錄。'],
   performance: ['策略績效', '只用你記錄且已平倉的實際成交，計算策略表現與風險。'],
+  smart: ['Smart Entry Lab', '把每次 Bot 訊號的預期進場先鎖定，再長期追蹤成交率、MFE、MAE、停損與 2R。'],
   trades: ['交易明細', '新增、編輯與平倉你的實際成交，不把 Bot 紙上提醒混入績效。'],
   shadow: ['Shadow Lab', '模擬實驗獨立呈現，不混入正式實際成交績效。'],
 };
 
 let snapshot = emptySnapshot();
 let alerts = [];
+let smartEntries = [];
 let runtime = null;
 let liveError = '';
 let session = loadSession();
@@ -128,6 +131,95 @@ function performanceView() {
   return `<div class="metrics">${metric('區間淨損益', s.closed ? signed(s.pnl) : '—', `近 ${days} 日 · TWD`, signClass(s.pnl))}${metric('已平倉勝率', percent(s.winRate), `${s.closed} 筆已平倉實際成交`)}${metric('獲利因子', s.profitFactor === null ? '—' : s.profitFactor === Infinity ? '∞' : s.profitFactor.toFixed(2), '獲利總額 ÷ 虧損絕對值')}${metric('最大回撤', s.closed ? money(s.maxDrawdown) : '—', 'TWD · 區間累積損益峰谷差')}</div><article class="panel"><div class="panel-head"><div><h2>累積已實現淨損益</h2><p>以實際進場日期分組 · 不含 Bot 紙上提醒與未實現損益</p></div><div class="period" aria-label="績效期間">${[7, 30, 90].map(d => `<button data-days="${d}" class="${days === d ? 'active' : ''}" aria-pressed="${days === d}">${d} 天</button>`).join('')}</div></div>${chart(trades, days)}</article><div class="panel wide-note"><span>⌁</span><div><strong>正式績效與 Shadow 分開</strong>淨損益由實際進出場價、股數與你填寫的交易成本計算。未平倉交易不會提前算進績效。</div></div>`;
 }
 
+
+function smartStatus(item) {
+  const statusMap = {
+    pending: ['等待成交', 'wait'],
+    filled: ['已成交追蹤', ''],
+    expired: ['未成交過期', 'closed'],
+    invalidated: ['進場前失效', 'closed'],
+    completed: ['追蹤完成', ''],
+  };
+  return statusMap[item.status] || [item.status || '—', 'closed'];
+}
+
+function smartOutcome(item) {
+  const map = {
+    '2r_first': '先到 2R',
+    'stop_first': '先碰停損',
+    'window_end': '60 分鐘結束',
+    'not_filled': '未成交',
+    'stop_before_fill': '進場前碰停損',
+  };
+  return map[item.first_event] || (item.status === 'filled' ? '追蹤中' : '—');
+}
+
+function smartView() {
+  const { date, strategy } = current();
+  const start = offsetDate(date, 1 - days);
+  const rows = smartEntries.filter(item =>
+    item.scan_date >= start &&
+    item.scan_date <= date &&
+    (strategy === 'all' || item.strategy === strategy)
+  );
+  const filled = rows.filter(item => item.fill_price !== null && item.fill_price !== undefined);
+  const hit2r = filled.filter(item => item.hit_2r).length;
+  const stopFirst = filled.filter(item => item.first_event === 'stop_first').length;
+  const avg = (field) => {
+    const values = filled.map(item => item[field]).filter(value => value !== null && value !== undefined && Number.isFinite(Number(value)));
+    return values.length ? values.reduce((sum, value) => sum + Number(value), 0) / values.length : null;
+  };
+  const fillRate = rows.length ? filled.length / rows.length * 100 : null;
+  const hit2rRate = filled.length ? hit2r / filled.length * 100 : null;
+  const stopRate = filled.length ? stopFirst / filled.length * 100 : null;
+  const avgMfe = avg('mfe_pct');
+  const avgMae = avg('mae_pct');
+
+  return `<div class="metrics">
+    ${metric('預期成交率', percent(fillRate), `${filled.length} / ${rows.length} 筆 SMART_V1`)}
+    ${metric('2R 命中率', percent(hit2rRate), filled.length ? `${hit2r} / ${filled.length} 筆模擬成交` : '等待模擬成交')}
+    ${metric('平均 MFE', avgMfe === null ? '—' : percent(avgMfe), '成交後最大有利幅度', 'positive')}
+    ${metric('平均 MAE', avgMae === null ? '—' : percent(avgMae), `成交後最大不利幅度 · 先停損 ${percent(stopRate)}`, avgMae ? 'negative' : '')}
+  </div>
+  <article class="panel smart-rule-card">
+    <div class="panel-head">
+      <div><h2>SMART_V1 預期進場規則</h2><p>先固定規則再收資料，避免事後看 K 線改答案</p></div>
+      <div class="period" aria-label="Smart Entry 期間">${[7,30,90].map(d => `<button data-days="${d}" class="${days===d?'active':''}" aria-pressed="${days===d}">${d} 天</button>`).join('')}</div>
+    </div>
+    <div class="smart-rule-grid">
+      <div><span>預期區間</span><strong>訊號價 ～ 上方 2 檔</strong><small>但不貼近或跨過原結構停損</small></div>
+      <div><span>預期限價</span><strong>訊號價上方 1 檔</strong><small>做空等一次小反彈，改善進場價</small></div>
+      <div><span>有效時間</span><strong>20 分鐘</strong><small>未成交就標記過期，不追價</small></div>
+      <div><span>追蹤時間</span><strong>成交後 60 分鐘</strong><small>記錄 5 / 15 / 30 / 60 分鐘、MFE / MAE</small></div>
+    </div>
+    <div class="callout">這是 Shadow 預期進場，不會送出任何委託。價格路徑依 Bot 約 30～120 秒掃描頻率抽樣，因此不是逐筆成交回放。</div>
+  </article>
+  <article class="panel smart-table">
+    <div class="panel-head">
+      <div><h2>Smart Entry 長期追蹤 <span class="count">${rows.length}</span></h2><p>比較「Bot 找到機會」與「等待更好的預期進場」是否真的改善結果</p></div>
+      <span>截至 ${esc(date)}</span>
+    </div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>訊號</th><th>股票</th><th>訊號價</th><th>預期區間 / 限價</th><th>停損 / 1R / 2R</th><th>狀態 / 結果</th><th>MFE / MAE</th><th>5 / 15 / 30 / 60 分</th></tr></thead>
+      <tbody>${rows.length ? rows.map(item => {
+        const [label, cls] = smartStatus(item);
+        const checkpoint = [item.price_5m,item.price_15m,item.price_30m,item.price_60m].map(v => v === null || v === undefined ? '—' : Number(v).toFixed(2)).join(' / ');
+        return `<tr>
+          <td>${esc(item.scan_date)}<small>${esc(item.signal_time)} · ${esc(item.model)}</small></td>
+          <td><strong>${esc(item.code)}</strong><small>${esc(item.name)}</small></td>
+          <td>${Number(item.signal_entry).toFixed(2)}<small>${item.payload?.grade ? esc(item.payload.grade)+'級' : ''} ${item.payload?.score ?? ''}</small></td>
+          <td>${Number(item.zone_low).toFixed(2)}～${Number(item.zone_high).toFixed(2)}<small>限價 <b>${Number(item.ideal_entry).toFixed(2)}</b>${item.fill_price !== null && item.fill_price !== undefined ? ' · 成交 '+Number(item.fill_price).toFixed(2) : ''}</small></td>
+          <td>${Number(item.stop).toFixed(2)}<small>1R ${Number(item.target_1r).toFixed(2)} · 2R ${Number(item.target_2r).toFixed(2)}</small></td>
+          <td><span class="chip ${cls}">${label}</span><small>${esc(smartOutcome(item))}${item.hit_scalp3 ? ' · ✓3檔' : ''}${item.hit_1r ? ' · ✓1R' : ''}${item.hit_2r ? ' · ✓2R' : ''}</small></td>
+          <td class="${item.mfe_pct ? 'positive' : ''}">${item.mfe_pct === null || item.mfe_pct === undefined ? '—' : '+'+Number(item.mfe_pct).toFixed(2)+'%'}<small class="${item.mae_pct ? 'negative' : ''}">MAE ${item.mae_pct === null || item.mae_pct === undefined ? '—' : Number(item.mae_pct).toFixed(2)+'%'}</small></td>
+          <td>${checkpoint}<small>抽樣 ${money(item.samples)} 次</small></td>
+        </tr>`;
+      }).join('') : empty(8, '目前還沒有 Smart Entry 資料；下一個 V2.9 盤中提醒會自動建立。')}</tbody>
+    </table></div>
+    <div class="panel-bottom"><span>SMART_V1 固定規則，不回頭修改歷史預期價</span><span>只做研究，不自動下單</span></div>
+  </article>`;
+}
+
 function tradesView() {
   const rows = selectTrades(snapshot, { ...current(), days, status, query });
   return `<article class="panel"><div class="panel-head"><div><h2>實際交易記錄 <span class="count">${rows.length}</span></h2><p>你自行記錄的真實成交；可編輯與平倉</p></div><div class="table-tools"><input type="search" id="search" placeholder="搜尋代號或名稱" aria-label="搜尋代號或名稱" value="${esc(query)}"><select id="trade-period" aria-label="交易日期範圍">${[1, 7, 30, 90].map(d => `<option value="${d}" ${days === d ? 'selected' : ''}>近 ${d} 日</option>`).join('')}</select><select id="trade-status" aria-label="交易狀態"><option value="all">全部狀態</option><option value="open" ${status === 'open' ? 'selected' : ''}>未平倉</option><option value="closed" ${status === 'closed' ? 'selected' : ''}>已平倉</option></select><button id="export" class="button">↓ 匯出 CSV</button></div></div><div class="table-wrap"><table><thead><tr><th>日期 / 時間</th><th>股票</th><th>進場價</th><th>出場價</th><th>成本</th><th>淨損益 TWD</th><th>狀態</th><th>操作</th></tr></thead><tbody>${rows.length ? rows.map(t => `<tr><td>${esc(t.date)}<small>${esc(t.time)} · 台北</small></td><td><strong>${esc(t.code)}</strong><small>${esc(t.name)}</small></td><td>${Number(t.entry).toFixed(2)}</td><td>${t.status === 'closed' ? Number(t.exit).toFixed(2) : '—'}</td><td>${money(t.costs)}</td><td class="${signClass(t.status === 'closed' ? t.pnl : 0)}">${t.status === 'closed' ? signed(t.pnl) : '—'}</td><td><span class="chip ${t.status === 'closed' ? 'closed' : 'wait'}">${t.status === 'closed' ? '已平倉' : '未平倉'}</span></td><td><button class="table-link" data-detail="${esc(t.id)}">查看</button> · <button class="table-link" data-edit="${esc(t.id)}">編輯</button></td></tr>`).join('') : empty(8, '此篩選條件下沒有實際交易記錄')}</tbody></table></div><div class="panel-bottom"><span>Supabase · 私人 RLS 資料</span><span>共 ${rows.length} 筆</span></div></article>`;
@@ -152,7 +244,7 @@ function render() {
     else a.removeAttribute('aria-current');
   });
   renderStatus();
-  $('#view').innerHTML = ({ today: todayView, performance: performanceView, trades: tradesView, shadow: shadowView })[page]();
+  $('#view').innerHTML = ({ today: todayView, performance: performanceView, smart: smartView, trades: tradesView, shadow: shadowView })[page]();
 }
 
 function route() {
@@ -170,6 +262,7 @@ async function refreshData() {
     session = result.session;
     snapshot = result.snapshot;
     alerts = result.alerts;
+    smartEntries = result.smartEntries || [];
     runtime = result.runtime ? { ...result.runtime, candidate_scan_date: result.live?.candidate_scan_date } : null;
     liveError = result.liveError;
     $('#user-email').textContent = session?.user?.email || config.ownerEmail || '';
@@ -262,6 +355,7 @@ $('#logout').addEventListener('click', async () => {
   session = null;
   snapshot = emptySnapshot();
   alerts = [];
+  smartEntries = [];
   runtime = null;
   showLogin('');
 });
