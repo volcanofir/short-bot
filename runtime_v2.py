@@ -43,6 +43,11 @@ DASHBOARD_ALLOWED_ORIGINS = {
 }
 _dashboard_push_lock = threading.Lock()
 _dashboard_last_fingerprint = None
+_smart_lock = threading.Lock()
+_smart_entries = {}
+_smart_restore_done = False
+SMART_ENTRY_TTL_MINUTES = 20
+SMART_ENTRY_TRACK_MINUTES = 60
 
 
 def _dashboard_cors(response):
@@ -184,6 +189,278 @@ def _dashboard_alerts(now):
     return rows
 
 
+
+def _parse_smart_dt(value):
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value))
+        if dt.tzinfo is None:
+            return TW_TZ.localize(dt)
+        return dt.astimezone(TW_TZ)
+    except Exception:
+        return None
+
+
+def _smart_session_end(day):
+    return TW_TZ.localize(datetime(day.year, day.month, day.day, 11, 30))
+
+
+def _smart_entry_from_alert(alert, now):
+    signal = float(alert["entry"])
+    stop = float(alert["stop"])
+    zone_low = signal
+    zone_high = min(
+        float(v2.v21.move_ticks(signal, +2)),
+        float(v2.v21.move_ticks(stop, -1)),
+    )
+    if zone_high < zone_low:
+        zone_high = zone_low
+
+    ideal = min(float(v2.v21.move_ticks(signal, +1)), zone_high)
+    if ideal < zone_low:
+        ideal = zone_low
+
+    risk = stop - ideal
+    if risk <= 0:
+        return None
+
+    signal_dt = TW_TZ.localize(
+        datetime.strptime(
+            f"{alert['scan_date']} {alert['alert_time']}",
+            "%Y-%m-%d %H:%M",
+        )
+    )
+    expires_at = min(
+        signal_dt + timedelta(minutes=SMART_ENTRY_TTL_MINUTES),
+        _smart_session_end(signal_dt.date()),
+    )
+    target_1r = float(v2.v21.floor_to_tick(ideal - risk))
+    target_2r = float(v2.v21.floor_to_tick(ideal - risk * 2))
+    target_scalp3 = (
+        (alert.get("payload") or {}).get("scalp_3")
+        or float(v2.v21.move_ticks(ideal, -3))
+    )
+
+    return {
+        "id": f"SMART:{alert['id']}",
+        "source_alert_id": alert["id"],
+        "scan_date": alert["scan_date"],
+        "signal_time": alert["alert_time"],
+        "code": alert["code"],
+        "name": alert["name"],
+        "strategy": "V2.9",
+        "model": "SMART_V1",
+        "signal_entry": signal,
+        "zone_low": zone_low,
+        "zone_high": zone_high,
+        "ideal_entry": ideal,
+        "stop": stop,
+        "target_scalp3": float(target_scalp3),
+        "target_1r": target_1r,
+        "target_2r": target_2r,
+        "expires_at": expires_at.isoformat(),
+        "status": "pending",
+        "filled_at": None,
+        "fill_price": None,
+        "first_event": None,
+        "first_event_at": None,
+        "lowest_price": None,
+        "highest_price": None,
+        "mfe_pct": None,
+        "mae_pct": None,
+        "price_5m": None,
+        "price_15m": None,
+        "price_30m": None,
+        "price_60m": None,
+        "hit_scalp3": False,
+        "hit_1r": False,
+        "hit_2r": False,
+        "hit_stop": False,
+        "samples": 0,
+        "payload": {
+            "rule": "V2.9訊號後，上方1檔作為SMART_V1預期限價；20分鐘未成交取消",
+            "zone_rule": "訊號價至上方2檔，且不得貼近/越過原結構停損",
+            "tracking": "成交後依Bot掃描頻率抽樣60分鐘；非逐筆tick回放",
+            "setup": alert.get("setup"),
+            "grade": alert.get("grade"),
+            "score": alert.get("score"),
+            "reentry": bool(alert.get("reentry")),
+        },
+    }
+
+
+def _ensure_smart_entries(now):
+    alerts = _dashboard_alerts(now)
+    with _smart_lock:
+        for alert in alerts:
+            smart_id = f"SMART:{alert['id']}"
+            if smart_id in _smart_entries:
+                continue
+            item = _smart_entry_from_alert(alert, now)
+            if item:
+                _smart_entries[smart_id] = item
+
+        cutoff = now.date() - timedelta(days=2)
+        stale = []
+        for smart_id, item in _smart_entries.items():
+            try:
+                if datetime.strptime(item["scan_date"], "%Y-%m-%d").date() < cutoff:
+                    stale.append(smart_id)
+            except Exception:
+                pass
+        for smart_id in stale:
+            _smart_entries.pop(smart_id, None)
+
+
+def _smart_rows():
+    with _smart_lock:
+        return [dict(item) for item in _smart_entries.values()]
+
+
+def _restore_pending_smart_entries():
+    global _smart_restore_done
+    if _smart_restore_done or not getattr(legacy, "TG_TOKEN", ""):
+        return
+    try:
+        r = requests.post(
+            f"{SUPABASE_URL}/rest/v1/rpc/fetch_short_bot_pending_smart_entries",
+            headers={
+                "apikey": SUPABASE_PUBLISHABLE_KEY,
+                "Content-Type": "application/json",
+                "x-short-bot-token": legacy.TG_TOKEN,
+            },
+            json={},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return
+        rows = r.json() or []
+        if isinstance(rows, dict):
+            rows = rows.get("result") or rows.get("data") or []
+        if not isinstance(rows, list):
+            rows = []
+        with _smart_lock:
+            for item in rows:
+                if isinstance(item, dict) and item.get("id"):
+                    _smart_entries.setdefault(item["id"], item)
+        _smart_restore_done = True
+        logger.info("Smart Entry restore: %s active rows", len(rows))
+    except Exception as exc:
+        logger.info("Smart Entry restore error: %s", exc)
+
+
+def _update_smart_entries(now):
+    if now.weekday() >= 5:
+        return
+
+    with _smart_lock:
+        active_ids = [
+            smart_id
+            for smart_id, item in _smart_entries.items()
+            if item.get("status") in ("pending", "filled")
+        ]
+
+    for smart_id in active_ids:
+        with _smart_lock:
+            item = _smart_entries.get(smart_id)
+            if not item:
+                continue
+            item = dict(item)
+
+        expires_at = _parse_smart_dt(item.get("expires_at"))
+        filled_at = _parse_smart_dt(item.get("filled_at"))
+
+        if item.get("status") == "pending" and expires_at and now >= expires_at:
+            item["status"] = "expired"
+            item["first_event"] = item.get("first_event") or "not_filled"
+            item["first_event_at"] = item.get("first_event_at") or now.isoformat()
+            with _smart_lock:
+                _smart_entries[smart_id] = item
+            continue
+
+        if item.get("status") not in ("pending", "filled"):
+            continue
+
+        try:
+            quote = legacy.fugle_quote(item["code"])
+        except Exception as exc:
+            logger.debug("Smart Entry quote %s: %s", item.get("code"), exc)
+            quote = None
+        if not quote or quote.get("current") in (None, 0):
+            continue
+
+        price = float(quote["current"])
+        item["samples"] = int(item.get("samples") or 0) + 1
+
+        if item.get("status") == "pending":
+            if price >= float(item["stop"]):
+                item["status"] = "invalidated"
+                item["first_event"] = "stop_before_fill"
+                item["first_event_at"] = now.isoformat()
+                with _smart_lock:
+                    _smart_entries[smart_id] = item
+                continue
+
+            if price >= float(item["ideal_entry"]):
+                item["status"] = "filled"
+                item["filled_at"] = now.isoformat()
+                item["fill_price"] = float(item["ideal_entry"])
+                item["lowest_price"] = float(item["ideal_entry"])
+                item["highest_price"] = float(item["ideal_entry"])
+                filled_at = now
+            else:
+                with _smart_lock:
+                    _smart_entries[smart_id] = item
+                continue
+
+        if item.get("status") == "filled":
+            fill = float(item.get("fill_price") or item["ideal_entry"])
+            low = min(float(item.get("lowest_price") or fill), price)
+            high = max(float(item.get("highest_price") or fill), price)
+            item["lowest_price"] = low
+            item["highest_price"] = high
+            item["mfe_pct"] = round((fill - low) / fill * 100, 4)
+            item["mae_pct"] = round((high - fill) / fill * 100, 4)
+
+            filled_at = filled_at or _parse_smart_dt(item.get("filled_at")) or now
+            elapsed = max(0.0, (now - filled_at).total_seconds() / 60.0)
+            for minutes, field in (
+                (5, "price_5m"),
+                (15, "price_15m"),
+                (30, "price_30m"),
+                (60, "price_60m"),
+            ):
+                if elapsed >= minutes and item.get(field) is None:
+                    item[field] = price
+
+            if item.get("target_scalp3") is not None and price <= float(item["target_scalp3"]):
+                item["hit_scalp3"] = True
+            if price <= float(item["target_1r"]):
+                item["hit_1r"] = True
+            if price <= float(item["target_2r"]):
+                item["hit_2r"] = True
+            if price >= float(item["stop"]):
+                item["hit_stop"] = True
+
+            if not item.get("first_event"):
+                if item["hit_stop"]:
+                    item["first_event"] = "stop_first"
+                    item["first_event_at"] = now.isoformat()
+                elif item["hit_2r"]:
+                    item["first_event"] = "2r_first"
+                    item["first_event_at"] = now.isoformat()
+
+            if elapsed >= SMART_ENTRY_TRACK_MINUTES or now >= _smart_session_end(now.date()):
+                item["status"] = "completed"
+                if not item.get("first_event"):
+                    item["first_event"] = "window_end"
+                    item["first_event_at"] = now.isoformat()
+
+        with _smart_lock:
+            _smart_entries[smart_id] = item
+
+
 def _monitor_window(now):
     hm = now.hour * 60 + now.minute
     return now.weekday() < 5 and 9 * 60 <= hm < v2.MONITOR_END_MINUTE
@@ -206,6 +483,7 @@ def guarded_intraday_monitor():
         _last_scan_ts = ts
         _last_scan_text = now.isoformat()
         _base_intraday_monitor()
+        _ensure_smart_entries(now)
         _push_dashboard_snapshot()
     except Exception as exc:
         logger.error("V2.9 guarded intraday scan error: %s", exc)
@@ -339,10 +617,15 @@ def _push_dashboard_snapshot(force=False):
         now = datetime.now(TW_TZ)
         candidates = _dashboard_candidates(now)
         alerts = _dashboard_alerts(now)
-        if not candidates and not alerts:
+        smart_entries = _smart_rows()
+        if not candidates and not alerts and not smart_entries:
             return False
 
-        payload = {"p_candidates": candidates, "p_alerts": alerts}
+        payload = {
+            "p_candidates": candidates,
+            "p_alerts": alerts,
+            "p_smart_entries": smart_entries,
+        }
         # Normalize any uncommon numeric/date-like values nested in diagnostic
         # payloads while preserving the explicit top-level numeric fields.
         payload = json.loads(json.dumps(payload, ensure_ascii=False, default=str))
@@ -365,8 +648,8 @@ def _push_dashboard_snapshot(force=False):
         if r.status_code in (200, 201, 204):
             _dashboard_last_fingerprint = fingerprint
             logger.info(
-                "Dashboard Supabase sync OK: candidates=%s alerts=%s",
-                len(candidates), len(alerts),
+                "Dashboard Supabase sync OK: candidates=%s alerts=%s smart=%s",
+                len(candidates), len(alerts), len(smart_entries),
             )
             return True
 
@@ -385,6 +668,10 @@ def dashboard_sync_loop():
     logger.info("Dashboard Supabase sync loop started")
     while True:
         try:
+            now = datetime.now(TW_TZ)
+            _restore_pending_smart_entries()
+            _ensure_smart_entries(now)
+            _update_smart_entries(now)
             _push_dashboard_snapshot()
         except Exception as exc:
             logger.info("Dashboard sync loop error: %s", exc)
@@ -428,11 +715,14 @@ def dashboard_live():
         "candidate_scan_date": dashboard_candidate_scan_date(now).isoformat(),
         "candidates": _dashboard_candidates(now),
         "alerts": _dashboard_alerts(now),
+        "smart_entries": _smart_rows(),
         "runtime": {
             "version": "2.9-runtime",
             "last_precise_scan": _last_scan_text,
             "watchlist": len(legacy._watchlist_today),
             "alerted_today": len(legacy._alerted_today),
+            "smart_entries": len(_smart_rows()),
+            "smart_model": "SMART_V1",
             "primary_end": "10:00",
             "secondary_end": "11:30",
         },
@@ -469,6 +759,8 @@ def runtime_status():
         "chip2_chaos_score_min": v2.CHIP2_CHAOS_SCORE_MIN,
         "max_structural_risk_pct": v2.MAX_STRUCTURAL_RISK_PCT,
         "max_alerts_per_symbol": v2.MAX_ALERTS_PER_SYMBOL,
+        "smart_entries": len(_smart_rows()),
+        "smart_model": "SMART_V1",
         "primary_end": "10:00",
         "secondary_end": "11:30",
         "time": datetime.now(TW_TZ).isoformat(),
