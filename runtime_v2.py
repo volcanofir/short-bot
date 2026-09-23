@@ -713,13 +713,24 @@ def _push_dashboard_snapshot(force=False):
         candidates = _dashboard_candidates(now)
         alerts = _dashboard_alerts(now)
         smart_entries = _smart_rows()
-        if not candidates and not alerts and not smart_entries:
-            return False
-
         payload = {
             "p_candidates": candidates,
             "p_alerts": alerts,
             "p_smart_entries": smart_entries,
+            "p_runtime": {
+                "version": "2.9-runtime",
+                "smart_model": "SMART_V1",
+                "last_seen": now.isoformat(),
+                "last_scan": _last_scan_text,
+                "watchlist": len(legacy._watchlist_today),
+                "alerted": len(legacy._alerted_today),
+                "smart_entries": len(smart_entries),
+                "payload": {
+                    "candidate_scan_date": dashboard_candidate_scan_date(now).isoformat(),
+                    "primary_end": "10:00",
+                    "secondary_end": "11:30",
+                },
+            },
         }
         # Normalize any uncommon numeric/date-like values nested in diagnostic
         # payloads while preserving the explicit top-level numeric fields.
@@ -731,7 +742,7 @@ def _push_dashboard_snapshot(force=False):
             return True
 
         r = requests.post(
-            f"{SUPABASE_URL}/rest/v1/rpc/ingest_short_bot",
+            f"{SUPABASE_URL}/rest/v1/rpc/ingest_short_bot_v2",
             headers={
                 "apikey": SUPABASE_PUBLISHABLE_KEY,
                 "Content-Type": "application/json",
