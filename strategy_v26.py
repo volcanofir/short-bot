@@ -444,10 +444,24 @@ def _send_alert_v26(
     reason_text = "、".join(reasons)
     entry_tag = "♻️ 二次進場" if second_entry else "🎯 首次進場"
 
+    # SMART_V1 is a shadow expectation only. It waits one tick above the
+    # original reference entry, allows a two-tick zone, and never crosses the
+    # existing structural stop. runtime_v2 records the same frozen rule.
+    smart_zone_high = min(
+        v21.move_ticks(entry, +2),
+        v21.move_ticks(stop, -1),
+    )
+    if smart_zone_high < entry:
+        smart_zone_high = entry
+    smart_ideal = min(v21.move_ticks(entry, +1), smart_zone_high)
+    if smart_ideal < entry:
+        smart_ideal = entry
+
     alert = (
         f"🚨 <b>{grade}級短空候選｜V2.6｜{now.strftime('%H:%M')}</b>\n\n"
         f"<b>{code} {stock['name']}</b> [{stock.get('market','')}]｜分數 <b>{score}</b>\n"
         f"  🧩 {setup_name}｜{entry_tag}\n"
+        f"  🧠 Smart V1：<b>{entry}~{smart_zone_high}</b>｜預期限價 <b>{smart_ideal}</b>｜20分未到取消（Shadow）\n"
         f"  ✅ {reason_text}\n"
         f"  📍 現價 <b>{quote['current']}</b>（{quote['pct']:+.2f}%）｜開盤 {open_text}\n"
         f"  🟢 昨高 {ps.get('prev_high')}【{prev_status}】｜+2.5% {ps.get('plus25')}【{plus_status}】\n"
