@@ -163,60 +163,71 @@ function smartView() {
     (strategy === 'all' || item.strategy === strategy)
   );
   const filled = rows.filter(item => item.fill_price !== null && item.fill_price !== undefined);
-  const hit2r = filled.filter(item => item.hit_2r).length;
-  const stopFirst = filled.filter(item => item.first_event === 'stop_first').length;
-  const avg = (field) => {
-    const values = filled.map(item => item[field]).filter(value => value !== null && value !== undefined && Number.isFinite(Number(value)));
+  const baseline2r = rows.filter(item => item.baseline_hit_2r).length;
+  const smart2r = rows.filter(item => item.hit_2r).length;
+  const baselineStopFirst = rows.filter(item => item.baseline_first_event === 'stop_first').length;
+  const smartStopFirst = rows.filter(item => item.first_event === 'stop_first').length;
+  const fillRate = rows.length ? filled.length / rows.length * 100 : null;
+  const baseline2rRate = rows.length ? baseline2r / rows.length * 100 : null;
+  const smart2rEffectiveRate = rows.length ? smart2r / rows.length * 100 : null;
+  const delta = baseline2rRate === null || smart2rEffectiveRate === null ? null : smart2rEffectiveRate - baseline2rRate;
+  const avg = (list, field) => {
+    const values = list.map(item => item[field]).filter(value => value !== null && value !== undefined && Number.isFinite(Number(value)));
     return values.length ? values.reduce((sum, value) => sum + Number(value), 0) / values.length : null;
   };
-  const fillRate = rows.length ? filled.length / rows.length * 100 : null;
-  const hit2rRate = filled.length ? hit2r / filled.length * 100 : null;
-  const stopRate = filled.length ? stopFirst / filled.length * 100 : null;
-  const avgMfe = avg('mfe_pct');
-  const avgMae = avg('mae_pct');
+  const smartMfe = avg(filled, 'mfe_pct');
+  const smartMae = avg(filled, 'mae_pct');
+  const baseMfe = avg(rows, 'baseline_mfe_pct');
+  const baseMae = avg(rows, 'baseline_mae_pct');
 
   return `<div class="metrics">
-    ${metric('預期成交率', percent(fillRate), `${filled.length} / ${rows.length} 筆 SMART_V1`)}
-    ${metric('2R 命中率', percent(hit2rRate), filled.length ? `${hit2r} / ${filled.length} 筆模擬成交` : '等待模擬成交')}
-    ${metric('平均 MFE', avgMfe === null ? '—' : percent(avgMfe), '成交後最大有利幅度', 'positive')}
-    ${metric('平均 MAE', avgMae === null ? '—' : percent(avgMae), `成交後最大不利幅度 · 先停損 ${percent(stopRate)}`, avgMae ? 'negative' : '')}
+    ${metric('V2.9 基準 2R', percent(baseline2rRate), `${baseline2r} / ${rows.length} 筆訊號`)}
+    ${metric('SMART_V1 有效 2R', percent(smart2rEffectiveRate), `${smart2r} / ${rows.length} 筆原始訊號`, signClass(delta))}
+    ${metric('預期成交率', percent(fillRate), `${filled.length} / ${rows.length} 筆等到預期限價`)}
+    ${metric('Smart - 基準', delta === null ? '—' : `${delta > 0 ? '+' : ''}${delta.toFixed(1)}%`, '2R 命中率差；樣本少時先不要下結論', signClass(delta))}
   </div>
   <article class="panel smart-rule-card">
     <div class="panel-head">
-      <div><h2>SMART_V1 預期進場規則</h2><p>先固定規則再收資料，避免事後看 K 線改答案</p></div>
+      <div><h2>SMART_V1 預期進場規則</h2><p>原 V2.9 訊號與 Smart Entry 同時鎖定，兩條路徑都保存，避免事後改答案</p></div>
       <div class="period" aria-label="Smart Entry 期間">${[7,30,90].map(d => `<button data-days="${d}" class="${days===d?'active':''}" aria-pressed="${days===d}">${d} 天</button>`).join('')}</div>
     </div>
     <div class="smart-rule-grid">
-      <div><span>預期區間</span><strong>訊號價 ～ 上方 2 檔</strong><small>但不貼近或跨過原結構停損</small></div>
-      <div><span>預期限價</span><strong>訊號價上方 1 檔</strong><small>做空等一次小反彈，改善進場價</small></div>
-      <div><span>有效時間</span><strong>20 分鐘</strong><small>未成交就標記過期，不追價</small></div>
-      <div><span>追蹤時間</span><strong>成交後 60 分鐘</strong><small>記錄 5 / 15 / 30 / 60 分鐘、MFE / MAE</small></div>
+      <div><span>基準路徑</span><strong>V2.9 訊號價直接進</strong><small>用原結構停損，追蹤 1R / 2R、MFE / MAE</small></div>
+      <div><span>Smart 預期限價</span><strong>訊號價上方 1 檔</strong><small>可接受區間為訊號價～上方 2 檔，且不得跨過停損</small></div>
+      <div><span>Smart 有效時間</span><strong>20 分鐘</strong><small>沒有等到預期價就標記未成交，不追價</small></div>
+      <div><span>觀察窗口</span><strong>60 分鐘</strong><small>同時記錄 5 / 15 / 30 / 60 分鐘與路徑極值</small></div>
     </div>
-    <div class="callout">這是 Shadow 預期進場，不會送出任何委託。價格路徑依 Bot 約 30～120 秒掃描頻率抽樣，因此不是逐筆成交回放。</div>
+    <div class="smart-compare-strip">
+      <span>基準平均 MFE <b>${baseMfe === null ? '—' : baseMfe.toFixed(2)+'%'}</b> / MAE <b>${baseMae === null ? '—' : baseMae.toFixed(2)+'%'}</b></span>
+      <span>Smart 成交後平均 MFE <b>${smartMfe === null ? '—' : smartMfe.toFixed(2)+'%'}</b> / MAE <b>${smartMae === null ? '—' : smartMae.toFixed(2)+'%'}</b></span>
+      <span>先停損：基準 <b>${baselineStopFirst}</b> / Smart <b>${smartStopFirst}</b></span>
+    </div>
+    <div class="callout">這是 Shadow 預期進場，不會送出任何委託。價格路徑依 Bot 約 30～120 秒掃描頻率抽樣，因此不是逐筆成交回放；長期統計主要用來判斷「選股/訊號有問題」還是「等待進場規則有問題」。</div>
   </article>
   <article class="panel smart-table">
     <div class="panel-head">
-      <div><h2>Smart Entry 長期追蹤 <span class="count">${rows.length}</span></h2><p>比較「Bot 找到機會」與「等待更好的預期進場」是否真的改善結果</p></div>
+      <div><h2>Smart Entry 長期追蹤 <span class="count">${rows.length}</span></h2><p>同一筆訊號並排比較 V2.9 原始進場與 SMART_V1</p></div>
       <span>截至 ${esc(date)}</span>
     </div>
     <div class="table-wrap"><table>
-      <thead><tr><th>訊號</th><th>股票</th><th>訊號價</th><th>預期區間 / 限價</th><th>停損 / 1R / 2R</th><th>狀態 / 結果</th><th>MFE / MAE</th><th>5 / 15 / 30 / 60 分</th></tr></thead>
+      <thead><tr><th>訊號</th><th>股票</th><th>預期區間 / 限價</th><th>V2.9 基準</th><th>SMART_V1</th><th>停損 / Smart 1R / 2R</th><th>Smart MFE / MAE</th><th>Smart 5 / 15 / 30 / 60 分</th></tr></thead>
       <tbody>${rows.length ? rows.map(item => {
         const [label, cls] = smartStatus(item);
         const checkpoint = [item.price_5m,item.price_15m,item.price_30m,item.price_60m].map(v => v === null || v === undefined ? '—' : Number(v).toFixed(2)).join(' / ');
+        const baseTags = [item.baseline_hit_1r ? '✓1R' : '', item.baseline_hit_2r ? '✓2R' : '', item.baseline_hit_stop ? '停損' : ''].filter(Boolean).join(' · ') || (item.baseline_done ? '窗口結束' : '追蹤中');
         return `<tr>
           <td>${esc(item.scan_date)}<small>${esc(item.signal_time)} · ${esc(item.model)}</small></td>
           <td><strong>${esc(item.code)}</strong><small>${esc(item.name)}</small></td>
-          <td>${Number(item.signal_entry).toFixed(2)}<small>${item.payload?.grade ? esc(item.payload.grade)+'級' : ''} ${item.payload?.score ?? ''}</small></td>
-          <td>${Number(item.zone_low).toFixed(2)}～${Number(item.zone_high).toFixed(2)}<small>限價 <b>${Number(item.ideal_entry).toFixed(2)}</b>${item.fill_price !== null && item.fill_price !== undefined ? ' · 成交 '+Number(item.fill_price).toFixed(2) : ''}</small></td>
+          <td>${Number(item.zone_low).toFixed(2)}～${Number(item.zone_high).toFixed(2)}<small>預期限價 <b>${Number(item.ideal_entry).toFixed(2)}</b></small></td>
+          <td>${Number(item.signal_entry).toFixed(2)}<small>${baseTags} · MFE ${item.baseline_mfe_pct === null || item.baseline_mfe_pct === undefined ? '—' : Number(item.baseline_mfe_pct).toFixed(2)+'%'} / MAE ${item.baseline_mae_pct === null || item.baseline_mae_pct === undefined ? '—' : Number(item.baseline_mae_pct).toFixed(2)+'%'}</small></td>
+          <td><span class="chip ${cls}">${label}</span><small>${esc(smartOutcome(item))}${item.fill_price !== null && item.fill_price !== undefined ? ' · 成交 '+Number(item.fill_price).toFixed(2) : ''}${item.hit_1r ? ' · ✓1R' : ''}${item.hit_2r ? ' · ✓2R' : ''}</small></td>
           <td>${Number(item.stop).toFixed(2)}<small>1R ${Number(item.target_1r).toFixed(2)} · 2R ${Number(item.target_2r).toFixed(2)}</small></td>
-          <td><span class="chip ${cls}">${label}</span><small>${esc(smartOutcome(item))}${item.hit_scalp3 ? ' · ✓3檔' : ''}${item.hit_1r ? ' · ✓1R' : ''}${item.hit_2r ? ' · ✓2R' : ''}</small></td>
           <td class="${item.mfe_pct ? 'positive' : ''}">${item.mfe_pct === null || item.mfe_pct === undefined ? '—' : '+'+Number(item.mfe_pct).toFixed(2)+'%'}<small class="${item.mae_pct ? 'negative' : ''}">MAE ${item.mae_pct === null || item.mae_pct === undefined ? '—' : Number(item.mae_pct).toFixed(2)+'%'}</small></td>
           <td>${checkpoint}<small>抽樣 ${money(item.samples)} 次</small></td>
         </tr>`;
       }).join('') : empty(8, '目前還沒有 Smart Entry 資料；下一個 V2.9 盤中提醒會自動建立。')}</tbody>
     </table></div>
-    <div class="panel-bottom"><span>SMART_V1 固定規則，不回頭修改歷史預期價</span><span>只做研究，不自動下單</span></div>
+    <div class="panel-bottom"><span>SMART_V1 固定規則，不回頭修改歷史預期價</span><span>基準與 Smart 都是研究紀錄，不自動下單</span></div>
   </article>`;
 }
 
