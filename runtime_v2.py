@@ -221,8 +221,9 @@ def _smart_entry_from_alert(alert, now):
     if ideal < zone_low:
         ideal = zone_low
 
-    risk = stop - ideal
-    if risk <= 0:
+    smart_risk = stop - ideal
+    baseline_risk = stop - signal
+    if smart_risk <= 0 or baseline_risk <= 0:
         return None
 
     signal_dt = TW_TZ.localize(
@@ -235,8 +236,11 @@ def _smart_entry_from_alert(alert, now):
         signal_dt + timedelta(minutes=SMART_ENTRY_TTL_MINUTES),
         _smart_session_end(signal_dt.date()),
     )
-    target_1r = float(v2.v21.floor_to_tick(ideal - risk))
-    target_2r = float(v2.v21.floor_to_tick(ideal - risk * 2))
+
+    target_1r = float(v2.v21.floor_to_tick(ideal - smart_risk))
+    target_2r = float(v2.v21.floor_to_tick(ideal - smart_risk * 2))
+    baseline_target_1r = float(v2.v21.floor_to_tick(signal - baseline_risk))
+    baseline_target_2r = float(v2.v21.floor_to_tick(signal - baseline_risk * 2))
     target_scalp3 = (
         (alert.get("payload") or {}).get("scalp_3")
         or float(v2.v21.move_ticks(ideal, -3))
@@ -259,6 +263,8 @@ def _smart_entry_from_alert(alert, now):
         "target_scalp3": float(target_scalp3),
         "target_1r": target_1r,
         "target_2r": target_2r,
+        "baseline_target_1r": baseline_target_1r,
+        "baseline_target_2r": baseline_target_2r,
         "expires_at": expires_at.isoformat(),
         "status": "pending",
         "filled_at": None,
@@ -277,18 +283,31 @@ def _smart_entry_from_alert(alert, now):
         "hit_1r": False,
         "hit_2r": False,
         "hit_stop": False,
+        "baseline_lowest_price": signal,
+        "baseline_highest_price": signal,
+        "baseline_mfe_pct": 0.0,
+        "baseline_mae_pct": 0.0,
+        "baseline_price_5m": None,
+        "baseline_price_15m": None,
+        "baseline_price_30m": None,
+        "baseline_price_60m": None,
+        "baseline_hit_1r": False,
+        "baseline_hit_2r": False,
+        "baseline_hit_stop": False,
+        "baseline_first_event": None,
+        "baseline_first_event_at": None,
+        "baseline_done": False,
         "samples": 0,
         "payload": {
             "rule": "V2.9訊號後，上方1檔作為SMART_V1預期限價；20分鐘未成交取消",
             "zone_rule": "訊號價至上方2檔，且不得貼近/越過原結構停損",
-            "tracking": "成交後依Bot掃描頻率抽樣60分鐘；非逐筆tick回放",
+            "tracking": "Bot訊號基準與SMART_V1皆依掃描頻率抽樣60分鐘；非逐筆tick回放",
             "setup": alert.get("setup"),
             "grade": alert.get("grade"),
             "score": alert.get("score"),
             "reentry": bool(alert.get("reentry")),
         },
     }
-
 
 def _ensure_smart_entries(now):
     alerts = _dashboard_alerts(now)
@@ -359,6 +378,7 @@ def _update_smart_entries(now):
             smart_id
             for smart_id, item in _smart_entries.items()
             if item.get("status") in ("pending", "filled")
+            or not bool(item.get("baseline_done"))
         ]
 
     for smart_id in active_ids:
@@ -370,16 +390,28 @@ def _update_smart_entries(now):
 
         expires_at = _parse_smart_dt(item.get("expires_at"))
         filled_at = _parse_smart_dt(item.get("filled_at"))
+        try:
+            signal_dt = TW_TZ.localize(
+                datetime.strptime(
+                    f"{item['scan_date']} {item['signal_time']}",
+                    "%Y-%m-%d %H:%M",
+                )
+            )
+        except Exception:
+            signal_dt = now
 
         if item.get("status") == "pending" and expires_at and now >= expires_at:
             item["status"] = "expired"
             item["first_event"] = item.get("first_event") or "not_filled"
             item["first_event_at"] = item.get("first_event_at") or now.isoformat()
+
+        needs_quote = (
+            item.get("status") in ("pending", "filled")
+            or not bool(item.get("baseline_done"))
+        )
+        if not needs_quote:
             with _smart_lock:
                 _smart_entries[smart_id] = item
-            continue
-
-        if item.get("status") not in ("pending", "filled"):
             continue
 
         try:
@@ -388,31 +420,71 @@ def _update_smart_entries(now):
             logger.debug("Smart Entry quote %s: %s", item.get("code"), exc)
             quote = None
         if not quote or quote.get("current") in (None, 0):
+            with _smart_lock:
+                _smart_entries[smart_id] = item
             continue
 
         price = float(quote["current"])
         item["samples"] = int(item.get("samples") or 0) + 1
+
+        # Baseline = the original V2.9 alert entry. Track it even when SMART_V1
+        # never fills, so we can distinguish "strategy was good" from
+        # "smart waiting rule was too conservative".
+        if not bool(item.get("baseline_done")):
+            baseline = float(item["signal_entry"])
+            b_low = min(float(item.get("baseline_lowest_price") or baseline), price)
+            b_high = max(float(item.get("baseline_highest_price") or baseline), price)
+            item["baseline_lowest_price"] = b_low
+            item["baseline_highest_price"] = b_high
+            item["baseline_mfe_pct"] = round((baseline - b_low) / baseline * 100, 4)
+            item["baseline_mae_pct"] = round((b_high - baseline) / baseline * 100, 4)
+
+            elapsed_signal = max(0.0, (now - signal_dt).total_seconds() / 60.0)
+            for minutes, field in (
+                (5, "baseline_price_5m"),
+                (15, "baseline_price_15m"),
+                (30, "baseline_price_30m"),
+                (60, "baseline_price_60m"),
+            ):
+                if elapsed_signal >= minutes and item.get(field) is None:
+                    item[field] = price
+
+            if price <= float(item["baseline_target_1r"]):
+                item["baseline_hit_1r"] = True
+            if price <= float(item["baseline_target_2r"]):
+                item["baseline_hit_2r"] = True
+            if price >= float(item["stop"]):
+                item["baseline_hit_stop"] = True
+
+            if not item.get("baseline_first_event"):
+                if item["baseline_hit_stop"]:
+                    item["baseline_first_event"] = "stop_first"
+                    item["baseline_first_event_at"] = now.isoformat()
+                elif item["baseline_hit_2r"]:
+                    item["baseline_first_event"] = "2r_first"
+                    item["baseline_first_event_at"] = now.isoformat()
+
+            if (
+                elapsed_signal >= SMART_ENTRY_TRACK_MINUTES
+                or now >= _smart_session_end(now.date())
+            ):
+                item["baseline_done"] = True
+                if not item.get("baseline_first_event"):
+                    item["baseline_first_event"] = "window_end"
+                    item["baseline_first_event_at"] = now.isoformat()
 
         if item.get("status") == "pending":
             if price >= float(item["stop"]):
                 item["status"] = "invalidated"
                 item["first_event"] = "stop_before_fill"
                 item["first_event_at"] = now.isoformat()
-                with _smart_lock:
-                    _smart_entries[smart_id] = item
-                continue
-
-            if price >= float(item["ideal_entry"]):
+            elif price >= float(item["ideal_entry"]):
                 item["status"] = "filled"
                 item["filled_at"] = now.isoformat()
                 item["fill_price"] = float(item["ideal_entry"])
                 item["lowest_price"] = float(item["ideal_entry"])
                 item["highest_price"] = float(item["ideal_entry"])
                 filled_at = now
-            else:
-                with _smart_lock:
-                    _smart_entries[smart_id] = item
-                continue
 
         if item.get("status") == "filled":
             fill = float(item.get("fill_price") or item["ideal_entry"])
@@ -434,7 +506,10 @@ def _update_smart_entries(now):
                 if elapsed >= minutes and item.get(field) is None:
                     item[field] = price
 
-            if item.get("target_scalp3") is not None and price <= float(item["target_scalp3"]):
+            if (
+                item.get("target_scalp3") is not None
+                and price <= float(item["target_scalp3"])
+            ):
                 item["hit_scalp3"] = True
             if price <= float(item["target_1r"]):
                 item["hit_1r"] = True
@@ -451,7 +526,10 @@ def _update_smart_entries(now):
                     item["first_event"] = "2r_first"
                     item["first_event_at"] = now.isoformat()
 
-            if elapsed >= SMART_ENTRY_TRACK_MINUTES or now >= _smart_session_end(now.date()):
+            if (
+                elapsed >= SMART_ENTRY_TRACK_MINUTES
+                or now >= _smart_session_end(now.date())
+            ):
                 item["status"] = "completed"
                 if not item.get("first_event"):
                     item["first_event"] = "window_end"
@@ -459,7 +537,6 @@ def _update_smart_entries(now):
 
         with _smart_lock:
             _smart_entries[smart_id] = item
-
 
 def _monitor_window(now):
     hm = now.hour * 60 + now.minute
