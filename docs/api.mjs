@@ -256,7 +256,7 @@ export async function loadDashboard(config, date, session = loadSession()) {
   const experimentsPath =
     `dashboard_experiments?select=id,date,strategy,name,description,status,samples,win_rate,pnl,created_at&date=gte.${enc(start)}&date=lte.${enc(date)}&order=date.desc,created_at.desc`;
   const smartEntriesPath =
-    `dashboard_smart_entries?select=id,source_alert_id,scan_date,signal_time,code,name,strategy,model,signal_entry,zone_low,zone_high,ideal_entry,stop,target_scalp3,target_1r,target_2r,expires_at,status,filled_at,fill_price,first_event,first_event_at,lowest_price,highest_price,mfe_pct,mae_pct,price_5m,price_15m,price_30m,price_60m,hit_scalp3,hit_1r,hit_2r,hit_stop,samples,payload,created_at,updated_at&scan_date=gte.${enc(start)}&scan_date=lte.${enc(date)}&order=scan_date.desc,signal_time.desc`;
+    `dashboard_smart_entries?select=id,source_alert_id,scan_date,signal_time,code,name,strategy,model,signal_entry,zone_low,zone_high,ideal_entry,stop,target_scalp3,target_1r,target_2r,expires_at,status,filled_at,fill_price,first_event,first_event_at,lowest_price,highest_price,mfe_pct,mae_pct,price_5m,price_15m,price_30m,price_60m,hit_scalp3,hit_1r,hit_2r,hit_stop,samples,baseline_target_1r,baseline_target_2r,baseline_lowest_price,baseline_highest_price,baseline_mfe_pct,baseline_mae_pct,baseline_price_5m,baseline_price_15m,baseline_price_30m,baseline_price_60m,baseline_hit_1r,baseline_hit_2r,baseline_hit_stop,baseline_first_event,baseline_first_event_at,baseline_done,payload,created_at,updated_at&scan_date=gte.${enc(start)}&scan_date=lte.${enc(date)}&order=scan_date.desc,signal_time.desc`;
 
   const c = await supabase(config, active, candidatesPath);
   active = c.session;
@@ -339,6 +339,22 @@ export async function loadDashboard(config, date, session = loadSession()) {
     hit_1r: Boolean(row.hit_1r),
     hit_2r: Boolean(row.hit_2r),
     hit_stop: Boolean(row.hit_stop),
+    baseline_target_1r: row.baseline_target_1r === null || row.baseline_target_1r === undefined ? null : Number(row.baseline_target_1r),
+    baseline_target_2r: row.baseline_target_2r === null || row.baseline_target_2r === undefined ? null : Number(row.baseline_target_2r),
+    baseline_lowest_price: row.baseline_lowest_price === null || row.baseline_lowest_price === undefined ? null : Number(row.baseline_lowest_price),
+    baseline_highest_price: row.baseline_highest_price === null || row.baseline_highest_price === undefined ? null : Number(row.baseline_highest_price),
+    baseline_mfe_pct: row.baseline_mfe_pct === null || row.baseline_mfe_pct === undefined ? null : Number(row.baseline_mfe_pct),
+    baseline_mae_pct: row.baseline_mae_pct === null || row.baseline_mae_pct === undefined ? null : Number(row.baseline_mae_pct),
+    baseline_price_5m: row.baseline_price_5m === null || row.baseline_price_5m === undefined ? null : Number(row.baseline_price_5m),
+    baseline_price_15m: row.baseline_price_15m === null || row.baseline_price_15m === undefined ? null : Number(row.baseline_price_15m),
+    baseline_price_30m: row.baseline_price_30m === null || row.baseline_price_30m === undefined ? null : Number(row.baseline_price_30m),
+    baseline_price_60m: row.baseline_price_60m === null || row.baseline_price_60m === undefined ? null : Number(row.baseline_price_60m),
+    baseline_hit_1r: Boolean(row.baseline_hit_1r),
+    baseline_hit_2r: Boolean(row.baseline_hit_2r),
+    baseline_hit_stop: Boolean(row.baseline_hit_stop),
+    baseline_first_event: row.baseline_first_event || null,
+    baseline_first_event_at: row.baseline_first_event_at || null,
+    baseline_done: Boolean(row.baseline_done),
     payload: row.payload || {},
   });
   const storedSmart = (s.data || []).map(normalizeSmart);
