@@ -1,4 +1,4 @@
-const SESSION_KEY = 'short_bot_dashboard_session_v1';
+let memorySession = null;
 
 const json = async response => {
   const data = await response.json().catch(() => ({}));
@@ -18,21 +18,19 @@ const requireConfig = config => {
 };
 
 export function loadSession() {
-  try {
-    const raw = localStorage.getItem(SESSION_KEY);
-    return raw ? JSON.parse(raw) : null;
-  } catch {
-    return null;
-  }
+  // Fail closed: a fresh page load always starts signed out.
+  // Tokens live only in this page's JavaScript memory and are never persisted
+  // to localStorage/sessionStorage.
+  return memorySession;
 }
 
 export function saveSession(session) {
-  localStorage.setItem(SESSION_KEY, JSON.stringify(session));
+  memorySession = session;
   return session;
 }
 
 export function clearSession() {
-  localStorage.removeItem(SESSION_KEY);
+  memorySession = null;
 }
 
 export async function signIn(config, email, password) {
