@@ -257,6 +257,8 @@ export async function loadDashboard(config, date, session = loadSession()) {
     `dashboard_experiments?select=id,date,strategy,name,description,status,samples,win_rate,pnl,created_at&date=gte.${enc(start)}&date=lte.${enc(date)}&order=date.desc,created_at.desc`;
   const smartEntriesPath =
     `dashboard_smart_entries?select=id,source_alert_id,scan_date,signal_time,code,name,strategy,model,signal_entry,zone_low,zone_high,ideal_entry,stop,target_scalp3,target_1r,target_2r,expires_at,status,filled_at,fill_price,first_event,first_event_at,lowest_price,highest_price,mfe_pct,mae_pct,price_5m,price_15m,price_30m,price_60m,hit_scalp3,hit_1r,hit_2r,hit_stop,samples,baseline_target_1r,baseline_target_2r,baseline_lowest_price,baseline_highest_price,baseline_mfe_pct,baseline_mae_pct,baseline_price_5m,baseline_price_15m,baseline_price_30m,baseline_price_60m,baseline_hit_1r,baseline_hit_2r,baseline_hit_stop,baseline_first_event,baseline_first_event_at,baseline_done,payload,created_at,updated_at&scan_date=gte.${enc(start)}&scan_date=lte.${enc(date)}&order=scan_date.desc,signal_time.desc`;
+  const runtimePath =
+    'dashboard_runtime?select=id,version,smart_model,last_seen,last_scan,watchlist,alerted,smart_entries,payload&id=eq.1&limit=1';
 
   const c = await supabase(config, active, candidatesPath);
   active = c.session;
@@ -268,6 +270,8 @@ export async function loadDashboard(config, date, session = loadSession()) {
   active = e.session;
   const s = await supabase(config, active, smartEntriesPath);
   active = s.session;
+  const r = await supabase(config, active, runtimePath);
+  active = r.session;
 
   const candidates = (c.data || []).map(row => ({
     date: row.scan_date,
@@ -364,6 +368,17 @@ export async function loadDashboard(config, date, session = loadSession()) {
   const smartEntries = [...smartMap.values()].sort((a, b) =>
     (b.scan_date + b.signal_time).localeCompare(a.scan_date + a.signal_time)
   );
+  const storedRuntimeRow = Array.isArray(r.data) ? r.data[0] : null;
+  const storedRuntime = storedRuntimeRow ? {
+    version: storedRuntimeRow.version,
+    smart_model: storedRuntimeRow.smart_model,
+    last_seen: storedRuntimeRow.last_seen,
+    last_precise_scan: storedRuntimeRow.last_scan,
+    watchlist: Number(storedRuntimeRow.watchlist || 0),
+    alerted_today: Number(storedRuntimeRow.alerted || 0),
+    smart_entries: Number(storedRuntimeRow.smart_entries || 0),
+    ...(storedRuntimeRow.payload || {}),
+  } : null;
 
   return {
     session: active,
@@ -378,7 +393,7 @@ export async function loadDashboard(config, date, session = loadSession()) {
     },
     alerts,
     smartEntries,
-    runtime: live?.runtime || null,
+    runtime: live?.runtime || storedRuntime,
   };
 }
 
