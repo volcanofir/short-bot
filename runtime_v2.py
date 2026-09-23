@@ -316,6 +316,22 @@ def _ensure_smart_entries(now):
             smart_id = f"SMART:{alert['id']}"
             if smart_id in _smart_entries:
                 continue
+
+            # Never invent a Smart Entry retroactively after a deploy/restart.
+            # The prediction must be frozen at signal time to keep the research
+            # free of hindsight bias. Restored rows come from Supabase instead.
+            try:
+                signal_dt = TW_TZ.localize(
+                    datetime.strptime(
+                        f"{alert['scan_date']} {alert['alert_time']}",
+                        "%Y-%m-%d %H:%M",
+                    )
+                )
+                if abs((now - signal_dt).total_seconds()) > 180:
+                    continue
+            except Exception:
+                continue
+
             item = _smart_entry_from_alert(alert, now)
             if item:
                 _smart_entries[smart_id] = item
