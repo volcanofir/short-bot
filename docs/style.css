@@ -40,3 +40,26 @@
   .header-right{gap:8px}
   #new-trade{font-size:10px;padding:9px 10px}
 }
+
+
+/* Smart Entry Lab */
+.smart-rule-card{margin-bottom:22px}
+.smart-rule-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:0;border-bottom:1px solid var(--line)}
+.smart-rule-grid>div{padding:21px 22px;border-right:1px solid var(--line)}
+.smart-rule-grid>div:last-child{border-right:0}
+.smart-rule-grid span{display:block;color:var(--muted);font-size:9px;letter-spacing:.7px;margin-bottom:9px}
+.smart-rule-grid strong{display:block;font-size:15px;font-weight:500;color:#dce8ed;margin-bottom:7px}
+.smart-rule-grid small{display:block;color:#718596;font-size:9px;line-height:1.7}
+.smart-table td{vertical-align:top}
+.smart-table td b{font-weight:600;color:var(--green)}
+.smart-table .positive small{color:var(--red)}
+@media(max-width:1050px){
+  .smart-rule-grid{grid-template-columns:repeat(2,1fr)}
+  .smart-rule-grid>div:nth-child(2){border-right:0}
+  .smart-rule-grid>div:nth-child(-n+2){border-bottom:1px solid var(--line)}
+}
+@media(max-width:600px){
+  .smart-rule-grid{grid-template-columns:1fr}
+  .smart-rule-grid>div{border-right:0;border-bottom:1px solid var(--line)}
+  .smart-rule-grid>div:last-child{border-bottom:0}
+}
