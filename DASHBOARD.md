@@ -129,3 +129,38 @@ publish the frontend.
 
 To roll back the frontend, revert the relevant dashboard-branch commit. To roll back the Bot
 feed, revert the `runtime_v2.py` commit on `main`.
+
+
+## Smart Entry Lab
+
+Every new V2.9 intraday alert now creates a frozen `SMART_V1` research record.
+
+The goal is to separate two questions:
+
+1. **Was the original V2.9 signal useful?**
+2. **Did waiting for a better entry improve or hurt the result?**
+
+For each alert the Bot stores both paths:
+
+- **V2.9 baseline:** assumes the original alert entry.
+- **SMART_V1:** acceptable zone from the alert price through two ticks above it, with the
+  expected limit set one tick above the alert price. The expected entry may not cross or sit
+  beyond the original structural stop.
+- **Entry TTL:** 20 minutes. If the expected limit is not reached, SMART_V1 is marked expired.
+- **Tracking window:** 60 minutes after the relevant starting point, capped at the 11:30
+  monitoring-session end.
+- **Recorded diagnostics:** 5/15/30/60-minute sampled prices, MFE, MAE, 1R, 2R, stop-first,
+  fill rate and sample count.
+
+The original signal path keeps tracking even if SMART_V1 never fills. This is deliberate:
+otherwise a good V2.9 signal that moved down immediately could be misclassified as a bad
+strategy simply because the smarter waiting rule missed the trade.
+
+The price path is sampled at the Bot/runtime cadence (roughly 30–120 seconds depending on
+session phase), not reconstructed from tick-by-tick trades. Therefore the lab is designed for
+long-run strategy comparison rather than exact exchange-order simulation.
+
+The Dashboard's **Smart Entry** page compares baseline 2R rate, SMART_V1 effective 2R rate,
+expected fill rate, stop-first counts and average MFE/MAE over 7/30/90-day windows.
+
+Smart Entry is Shadow-only. It does not place orders and does not change V2.9 entry logic.
