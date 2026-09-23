@@ -255,6 +255,8 @@ export async function loadDashboard(config, date, session = loadSession()) {
     `dashboard_trades?select=id,date,time,exit_date,exit_time,code,name,strategy,status,entry,exit,quantity,costs,pnl,note,created_at,updated_at&date=gte.${enc(start)}&date=lte.${enc(date)}&order=date.desc,time.desc`;
   const experimentsPath =
     `dashboard_experiments?select=id,date,strategy,name,description,status,samples,win_rate,pnl,created_at&date=gte.${enc(start)}&date=lte.${enc(date)}&order=date.desc,created_at.desc`;
+  const smartEntriesPath =
+    `dashboard_smart_entries?select=id,source_alert_id,scan_date,signal_time,code,name,strategy,model,signal_entry,zone_low,zone_high,ideal_entry,stop,target_scalp3,target_1r,target_2r,expires_at,status,filled_at,fill_price,first_event,first_event_at,lowest_price,highest_price,mfe_pct,mae_pct,price_5m,price_15m,price_30m,price_60m,hit_scalp3,hit_1r,hit_2r,hit_stop,samples,payload,created_at,updated_at&scan_date=gte.${enc(start)}&scan_date=lte.${enc(date)}&order=scan_date.desc,signal_time.desc`;
 
   const c = await supabase(config, active, candidatesPath);
   active = c.session;
@@ -264,6 +266,8 @@ export async function loadDashboard(config, date, session = loadSession()) {
   active = t.session;
   const e = await supabase(config, active, experimentsPath);
   active = e.session;
+  const s = await supabase(config, active, smartEntriesPath);
+  active = s.session;
 
   const candidates = (c.data || []).map(row => ({
     date: row.scan_date,
@@ -309,6 +313,41 @@ export async function loadDashboard(config, date, session = loadSession()) {
     win_rate: row.win_rate === null ? null : Number(row.win_rate),
     pnl: Number(row.pnl),
   }));
+  const normalizeSmart = row => ({
+    ...row,
+    date: row.scan_date,
+    time: row.signal_time,
+    signal_entry: Number(row.signal_entry),
+    zone_low: Number(row.zone_low),
+    zone_high: Number(row.zone_high),
+    ideal_entry: Number(row.ideal_entry),
+    stop: Number(row.stop),
+    target_scalp3: row.target_scalp3 === null || row.target_scalp3 === undefined ? null : Number(row.target_scalp3),
+    target_1r: Number(row.target_1r),
+    target_2r: Number(row.target_2r),
+    fill_price: row.fill_price === null || row.fill_price === undefined ? null : Number(row.fill_price),
+    lowest_price: row.lowest_price === null || row.lowest_price === undefined ? null : Number(row.lowest_price),
+    highest_price: row.highest_price === null || row.highest_price === undefined ? null : Number(row.highest_price),
+    mfe_pct: row.mfe_pct === null || row.mfe_pct === undefined ? null : Number(row.mfe_pct),
+    mae_pct: row.mae_pct === null || row.mae_pct === undefined ? null : Number(row.mae_pct),
+    price_5m: row.price_5m === null || row.price_5m === undefined ? null : Number(row.price_5m),
+    price_15m: row.price_15m === null || row.price_15m === undefined ? null : Number(row.price_15m),
+    price_30m: row.price_30m === null || row.price_30m === undefined ? null : Number(row.price_30m),
+    price_60m: row.price_60m === null || row.price_60m === undefined ? null : Number(row.price_60m),
+    samples: Number(row.samples || 0),
+    hit_scalp3: Boolean(row.hit_scalp3),
+    hit_1r: Boolean(row.hit_1r),
+    hit_2r: Boolean(row.hit_2r),
+    hit_stop: Boolean(row.hit_stop),
+    payload: row.payload || {},
+  });
+  const storedSmart = (s.data || []).map(normalizeSmart);
+  const liveSmart = Array.isArray(live?.smart_entries) ? live.smart_entries.map(normalizeSmart) : [];
+  const smartMap = new Map(storedSmart.map(row => [row.id, row]));
+  for (const row of liveSmart) smartMap.set(row.id, row);
+  const smartEntries = [...smartMap.values()].sort((a, b) =>
+    (b.scan_date + b.signal_time).localeCompare(a.scan_date + a.signal_time)
+  );
 
   return {
     session: active,
@@ -322,6 +361,7 @@ export async function loadDashboard(config, date, session = loadSession()) {
       experiments,
     },
     alerts,
+    smartEntries,
     runtime: live?.runtime || null,
   };
 }
