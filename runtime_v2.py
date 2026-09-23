@@ -132,6 +132,7 @@ def _dashboard_candidates(now):
             "score": float(stock.get("strategy_score") or stock.get("score") or 0),
             "status": "已提醒" if scan_date == now.date() and code in alerted else "觀察中",
             "payload": {
+                "runtime_smart_model": "SMART_V1",
                 "market": stock.get("market"),
                 "watch_line": stock.get("watch_line"),
                 "prev_high": stock.get("prev_high"),
