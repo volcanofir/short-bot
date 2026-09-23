@@ -71,11 +71,13 @@ function showLogin(message = '') {
 
 function renderStatus() {
   const connected = Boolean(session && snapshot);
-  $('#source-badge').textContent = runtime ? 'Bot + Supabase' : connected ? 'Supabase' : '未連線';
+  const lastSeenMs = runtime?.last_seen ? Date.parse(runtime.last_seen) : null;
+  const botFresh = Boolean(runtime) && (!lastSeenMs || Date.now() - lastSeenMs < 180000);
+  $('#source-badge').textContent = botFresh ? 'Bot + Supabase' : connected ? 'Supabase' : '未連線';
   $('#source-badge').className = 'badge';
-  $('#bot-dot').className = `dot ${runtime ? '' : 'muted'}`;
+  $('#bot-dot').className = `dot ${botFresh ? '' : 'muted'}`;
   $('#bot-status').textContent = runtime
-    ? `已連線 · ${runtime.last_precise_scan ? '最近掃描 ' + new Date(runtime.last_precise_scan).toLocaleTimeString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false }) : '等待盤中掃描'}`
+    ? `${botFresh ? '已連線' : '心跳較舊'} · ${runtime.last_precise_scan ? '最近掃描 ' + new Date(runtime.last_precise_scan).toLocaleTimeString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false }) : runtime.last_seen ? '心跳 ' + new Date(runtime.last_seen).toLocaleTimeString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false }) : '等待盤中掃描'}`
     : '即時狀態未取得';
 
   const notice = $('#notice');
