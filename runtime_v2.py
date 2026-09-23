@@ -640,6 +640,7 @@ def runtime_status_text():
         f"乖離過大等待線：+{v2.EXTREME_GAIN_WAIT_PCT:g}%\n"
         f"處置股排除：{v2._disposal_stats.get('active', 0)} 支\n"
         f"2日籌碼分類：{v2._chip2_stats.get('classified', {})}\n"
+        f"Smart Entry：SMART_V1｜記錄 {len(_smart_rows())} 筆\n"
         "指令：/brokers 全分點；/broker 6226 單股；/chips2 二日；/chip2 6226；/disposals 處置\n"
         "時段：09:00~10:00主策略；10:00~11:30弱勢反彈/二次進場\n"
         "模式：只提醒，不自動下單"
