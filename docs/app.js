@@ -260,6 +260,7 @@ function render() {
 
 function route() {
   page = Object.hasOwn(titles, location.hash.slice(1)) ? location.hash.slice(1) : 'today';
+  if ((page === 'performance' || page === 'smart') && ![7, 30, 90].includes(days)) days = 30;
   render();
 }
 
