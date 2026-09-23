@@ -164,3 +164,11 @@ The Dashboard's **Smart Entry** page compares baseline 2R rate, SMART_V1 effecti
 expected fill rate, stop-first counts and average MFE/MAE over 7/30/90-day windows.
 
 Smart Entry is Shadow-only. It does not place orders and does not change V2.9 entry logic.
+
+
+## Runtime heartbeat
+
+Render now writes a one-row `dashboard_runtime` heartbeat through the authenticated Bot ingest
+path. The Dashboard can therefore distinguish a fresh Bot process from stale historical data
+without relying only on the browser's direct Render request. A heartbeat newer than roughly
+three minutes is shown as connected.
