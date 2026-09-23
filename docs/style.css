@@ -63,3 +63,11 @@
   .smart-rule-grid>div{border-right:0;border-bottom:1px solid var(--line)}
   .smart-rule-grid>div:last-child{border-bottom:0}
 }
+
+
+.smart-compare-strip{display:flex;flex-wrap:wrap;gap:12px 26px;padding:14px 22px;border-bottom:1px solid var(--line);background:#0f171f;color:var(--muted);font-size:10px}
+.smart-compare-strip b{color:#dbe6ec;font-weight:500}
+@media(max-width:600px){
+  .smart-compare-strip{display:grid;gap:8px}
+  nav a{font-size:10px;padding:8px 6px}
+}
