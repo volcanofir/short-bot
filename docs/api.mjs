@@ -257,6 +257,8 @@ export async function loadDashboard(config, date, session = loadSession()) {
     `dashboard_smart_entries?select=id,source_alert_id,scan_date,signal_time,code,name,strategy,model,signal_entry,zone_low,zone_high,ideal_entry,stop,target_scalp3,target_1r,target_2r,expires_at,status,filled_at,fill_price,first_event,first_event_at,lowest_price,highest_price,mfe_pct,mae_pct,price_5m,price_15m,price_30m,price_60m,hit_scalp3,hit_1r,hit_2r,hit_stop,samples,baseline_target_1r,baseline_target_2r,baseline_lowest_price,baseline_highest_price,baseline_mfe_pct,baseline_mae_pct,baseline_price_5m,baseline_price_15m,baseline_price_30m,baseline_price_60m,baseline_hit_1r,baseline_hit_2r,baseline_hit_stop,baseline_first_event,baseline_first_event_at,baseline_done,payload,created_at,updated_at&scan_date=gte.${enc(start)}&scan_date=lte.${enc(date)}&order=scan_date.desc,signal_time.desc`;
   const runtimePath =
     'dashboard_runtime?select=id,version,smart_model,last_seen,last_scan,watchlist,alerted,smart_entries,payload&id=eq.1&limit=1';
+  const tickAuditsPath =
+    `dashboard_tick_audits?select=id,source_alert_id,scan_date,signal_time,signal_at,code,name,strategy,model,entry,stop,scalp3,target_1r,target_2r,smart_ideal,smart_target_1r,smart_target_2r,smart_expires_at,tracking_until,status,tick_count,first_tick_at,last_tick_at,lowest_price,highest_price,scalp3_hit_at,baseline_1r_at,baseline_2r_at,stop_hit_at,baseline_first_event,baseline_first_event_at,baseline_first_event_price,smart_touch_at,smart_touch_price,smart_lowest_price,smart_highest_price,smart_1r_at,smart_2r_at,smart_stop_at,smart_first_event,smart_first_event_at,smart_first_event_price,payload,created_at,updated_at&scan_date=gte.${enc(start)}&scan_date=lte.${enc(date)}&order=scan_date.desc,signal_time.desc`;
 
   const c = await supabase(config, active, candidatesPath);
   active = c.session;
@@ -270,6 +272,8 @@ export async function loadDashboard(config, date, session = loadSession()) {
   active = s.session;
   const r = await supabase(config, active, runtimePath);
   active = r.session;
+  const ta = await supabase(config, active, tickAuditsPath);
+  active = ta.session;
 
   const candidates = (c.data || []).map(row => ({
     date: row.scan_date,
@@ -366,6 +370,26 @@ export async function loadDashboard(config, date, session = loadSession()) {
   const smartEntries = [...smartMap.values()].sort((a, b) =>
     (b.scan_date + b.signal_time).localeCompare(a.scan_date + a.signal_time)
   );
+  const tickAudits = (ta.data || []).map(row => ({
+    ...row,
+    entry: Number(row.entry),
+    stop: Number(row.stop),
+    scalp3: row.scalp3 === null ? null : Number(row.scalp3),
+    target_1r: Number(row.target_1r),
+    target_2r: Number(row.target_2r),
+    smart_ideal: row.smart_ideal === null ? null : Number(row.smart_ideal),
+    smart_target_1r: row.smart_target_1r === null ? null : Number(row.smart_target_1r),
+    smart_target_2r: row.smart_target_2r === null ? null : Number(row.smart_target_2r),
+    lowest_price: row.lowest_price === null ? null : Number(row.lowest_price),
+    highest_price: row.highest_price === null ? null : Number(row.highest_price),
+    baseline_first_event_price: row.baseline_first_event_price === null ? null : Number(row.baseline_first_event_price),
+    smart_touch_price: row.smart_touch_price === null ? null : Number(row.smart_touch_price),
+    smart_lowest_price: row.smart_lowest_price === null ? null : Number(row.smart_lowest_price),
+    smart_highest_price: row.smart_highest_price === null ? null : Number(row.smart_highest_price),
+    smart_first_event_price: row.smart_first_event_price === null ? null : Number(row.smart_first_event_price),
+    tick_count: Number(row.tick_count || 0),
+    payload: row.payload || {},
+  }));
   const storedRuntimeRow = Array.isArray(r.data) ? r.data[0] : null;
   const storedRuntime = storedRuntimeRow ? {
     version: storedRuntimeRow.version,
@@ -391,6 +415,7 @@ export async function loadDashboard(config, date, session = loadSession()) {
     },
     alerts,
     smartEntries,
+    tickAudits,
     runtime: live?.runtime || storedRuntime,
   };
 }
