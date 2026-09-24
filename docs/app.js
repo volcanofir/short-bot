@@ -182,12 +182,32 @@ function smartView() {
   const smartMae = avg(filled, 'mae_pct');
   const baseMfe = avg(rows, 'baseline_mfe_pct');
   const baseMae = avg(rows, 'baseline_mae_pct');
+  const tickRows = tickAudits.filter(item =>
+    item.scan_date >= start &&
+    item.scan_date <= date &&
+    (strategy === 'all' || item.strategy === strategy)
+  );
+  const tickByAlert = new Map(tickRows.map(item => [item.source_alert_id, item]));
+  const tickResolved = tickRows.filter(item => ['2r_first','stop_first'].includes(item.baseline_first_event));
+  const tickBaseline2r = tickResolved.filter(item => item.baseline_first_event === '2r_first').length;
+  const tickSmartTouched = tickRows.filter(item => item.smart_touch_at).length;
+  const tickSmartResolved = tickRows.filter(item => ['2r_first','stop_first'].includes(item.smart_first_event));
+  const tickSmart2r = tickSmartResolved.filter(item => item.smart_first_event === '2r_first').length;
+  const tickBaselineRate = tickResolved.length ? tickBaseline2r / tickResolved.length * 100 : null;
+  const tickSmartRate = tickSmartResolved.length ? tickSmart2r / tickSmartResolved.length * 100 : null;
+  const tickTouchRate = tickRows.length ? tickSmartTouched / tickRows.length * 100 : null;
 
   return `<div class="metrics">
     ${metric('V2.9 基準 2R', percent(baseline2rRate), `${baseline2r} / ${rows.length} 筆訊號`)}
     ${metric('SMART_V1 有效 2R', percent(smart2rEffectiveRate), `${smart2r} / ${rows.length} 筆原始訊號`, signClass(delta))}
     ${metric('預期成交率', percent(fillRate), `${filled.length} / ${rows.length} 筆等到預期限價`)}
     ${metric('Smart - 基準', delta === null ? '—' : `${delta > 0 ? '+' : ''}${delta.toFixed(1)}%`, '2R 命中率差；樣本少時先不要下結論', signClass(delta))}
+  </div>
+  <div class="metrics tick-metrics">
+    ${metric('Tick 精準判定', tickRows.length ? `${tickResolved.length} / ${tickRows.length}` : '—', '逐筆成交已分出 2R先到 / 停損先到')}
+    ${metric('Tick 基準 2R', percent(tickBaselineRate), tickResolved.length ? `${tickBaseline2r} / ${tickResolved.length} 筆已判定` : '等待下一筆訊號')}
+    ${metric('Smart 價格觸及率', percent(tickTouchRate), tickRows.length ? `${tickSmartTouched} / ${tickRows.length} 筆逐筆追蹤` : '等待 Tick 資料')}
+    ${metric('Tick Smart 2R', percent(tickSmartRate), tickSmartResolved.length ? `${tickSmart2r} / ${tickSmartResolved.length} 筆已判定` : '未觸價或尚在追蹤')}
   </div>
   <article class="panel smart-rule-card">
     <div class="panel-head">
@@ -205,7 +225,7 @@ function smartView() {
       <span>Smart 成交後平均 MFE <b>${smartMfe === null ? '—' : smartMfe.toFixed(2)+'%'}</b> / MAE <b>${smartMae === null ? '—' : smartMae.toFixed(2)+'%'}</b></span>
       <span>先停損：基準 <b>${baselineStopFirst}</b> / Smart <b>${smartStopFirst}</b></span>
     </div>
-    <div class="callout">這是 Shadow 預期進場，不會送出任何委託。價格路徑依 Bot 約 30～120 秒掃描頻率抽樣，因此不是逐筆成交回放；長期統計主要用來判斷「選股/訊號有問題」還是「等待進場規則有問題」。</div>
+    <div class="callout">這是 Shadow 預期進場，不會送出任何委託。新訊號優先用 Fugle TICK_V1 逐筆成交判斷先碰停損或先到 2R；沒有 Tick 才退回舊的 30～120 秒掃描資料。Smart「觸價」只表示市場成交價到達預期限價，不保證真實排隊委託一定成交。</div>
   </article>
   <article class="panel smart-table">
     <div class="panel-head">
@@ -216,14 +236,17 @@ function smartView() {
       <thead><tr><th>訊號</th><th>股票</th><th>預期區間 / 限價</th><th>V2.9 基準</th><th>SMART_V1</th><th>停損 / Smart 1R / 2R</th><th>Smart MFE / MAE</th><th>Smart 5 / 15 / 30 / 60 分</th></tr></thead>
       <tbody>${rows.length ? rows.map(item => {
         const [label, cls] = smartStatus(item);
+        const tick = tickByAlert.get(item.source_alert_id);
+        const tickBase = tick?.baseline_first_event === '2r_first' ? 'TICK ✓2R先到' : tick?.baseline_first_event === 'stop_first' ? 'TICK ✕停損先到' : tick ? 'TICK 追蹤中' : '無Tick';
+        const tickSmart = tick?.smart_first_event === '2r_first' ? 'TICK ✓2R先到' : tick?.smart_first_event === 'stop_first' ? 'TICK ✕停損先到' : tick?.smart_touch_at ? 'TICK 已觸價' : tick ? 'TICK 等待觸價' : '無Tick';
         const checkpoint = [item.price_5m,item.price_15m,item.price_30m,item.price_60m].map(v => v === null || v === undefined ? '—' : Number(v).toFixed(2)).join(' / ');
         const baseTags = [item.baseline_hit_1r ? '✓1R' : '', item.baseline_hit_2r ? '✓2R' : '', item.baseline_hit_stop ? '停損' : ''].filter(Boolean).join(' · ') || (item.baseline_done ? '窗口結束' : '追蹤中');
         return `<tr>
           <td>${esc(item.scan_date)}<small>${esc(item.signal_time)} · ${esc(item.model)}</small></td>
           <td><strong>${esc(item.code)}</strong><small>${esc(item.name)}</small></td>
           <td>${Number(item.zone_low).toFixed(2)}～${Number(item.zone_high).toFixed(2)}<small>預期限價 <b>${Number(item.ideal_entry).toFixed(2)}</b></small></td>
-          <td>${Number(item.signal_entry).toFixed(2)}<small>${baseTags} · MFE ${item.baseline_mfe_pct === null || item.baseline_mfe_pct === undefined ? '—' : Number(item.baseline_mfe_pct).toFixed(2)+'%'} / MAE ${item.baseline_mae_pct === null || item.baseline_mae_pct === undefined ? '—' : Number(item.baseline_mae_pct).toFixed(2)+'%'}</small></td>
-          <td><span class="chip ${cls}">${label}</span><small>${esc(smartOutcome(item))}${item.fill_price !== null && item.fill_price !== undefined ? ' · 成交 '+Number(item.fill_price).toFixed(2) : ''}${item.hit_1r ? ' · ✓1R' : ''}${item.hit_2r ? ' · ✓2R' : ''}</small></td>
+          <td>${Number(item.signal_entry).toFixed(2)}<small>${baseTags} · ${tickBase}<br>MFE ${item.baseline_mfe_pct === null || item.baseline_mfe_pct === undefined ? '—' : Number(item.baseline_mfe_pct).toFixed(2)+'%'} / MAE ${item.baseline_mae_pct === null || item.baseline_mae_pct === undefined ? '—' : Number(item.baseline_mae_pct).toFixed(2)+'%'}</small></td>
+          <td><span class="chip ${cls}">${label}</span><small>${esc(smartOutcome(item))}${item.fill_price !== null && item.fill_price !== undefined ? ' · 成交 '+Number(item.fill_price).toFixed(2) : ''}${item.hit_1r ? ' · ✓1R' : ''}${item.hit_2r ? ' · ✓2R' : ''}<br>${tickSmart}${tick?.tick_count ? ' · '+money(tick.tick_count)+' ticks' : ''}</small></td>
           <td>${Number(item.stop).toFixed(2)}<small>1R ${Number(item.target_1r).toFixed(2)} · 2R ${Number(item.target_2r).toFixed(2)}</small></td>
           <td class="${item.mfe_pct ? 'positive' : ''}">${item.mfe_pct === null || item.mfe_pct === undefined ? '—' : '+'+Number(item.mfe_pct).toFixed(2)+'%'}<small class="${item.mae_pct ? 'negative' : ''}">MAE ${item.mae_pct === null || item.mae_pct === undefined ? '—' : Number(item.mae_pct).toFixed(2)+'%'}</small></td>
           <td>${checkpoint}<small>抽樣 ${money(item.samples)} 次</small></td>
