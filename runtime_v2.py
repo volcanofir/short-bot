@@ -18,6 +18,7 @@ import requests
 from flask import jsonify, make_response, request
 
 import strategy_v29 as v2
+from tick_recorder import FugleTickRecorder
 
 app = v2.app
 legacy = v2.legacy
@@ -48,6 +49,15 @@ _smart_entries = {}
 _smart_restore_done = False
 SMART_ENTRY_TTL_MINUTES = 20
 SMART_ENTRY_TRACK_MINUTES = 60
+
+_tick_recorder = FugleTickRecorder(
+    api_key=getattr(legacy, "FUGLE_TOKEN", ""),
+    supabase_url=SUPABASE_URL,
+    supabase_publishable_key=SUPABASE_PUBLISHABLE_KEY,
+    ingest_token=getattr(legacy, "TG_TOKEN", ""),
+    tz=TW_TZ,
+    logger=logger,
+)
 
 
 def _dashboard_cors(response):
@@ -227,12 +237,18 @@ def _smart_entry_from_alert(alert, now):
     if smart_risk <= 0 or baseline_risk <= 0:
         return None
 
-    signal_dt = TW_TZ.localize(
+    signal_minute = TW_TZ.localize(
         datetime.strptime(
             f"{alert['scan_date']} {alert['alert_time']}",
             "%Y-%m-%d %H:%M",
         )
     )
+    # During live creation, keep the actual runtime second instead of rounding
+    # the signal back to HH:MM:00. Restored historical rows still use minute time.
+    if abs((now - signal_minute).total_seconds()) <= 180:
+        signal_dt = now
+    else:
+        signal_dt = signal_minute
     expires_at = min(
         signal_dt + timedelta(minutes=SMART_ENTRY_TTL_MINUTES),
         _smart_session_end(signal_dt.date()),
@@ -336,6 +352,51 @@ def _ensure_smart_entries(now):
             item = _smart_entry_from_alert(alert, now)
             if item:
                 _smart_entries[smart_id] = item
+                baseline_scalp3 = (alert.get("payload") or {}).get("scalp_3")
+                session_end = _smart_session_end(now.date())
+                tracking_until = min(
+                    now + timedelta(minutes=SMART_ENTRY_TRACK_MINUTES),
+                    session_end,
+                )
+                smart_expires_at = min(
+                    now + timedelta(minutes=SMART_ENTRY_TTL_MINUTES),
+                    session_end,
+                )
+                _tick_recorder.register_audit({
+                    "id": f"TICK:{alert['id']}",
+                    "source_alert_id": alert["id"],
+                    "scan_date": alert["scan_date"],
+                    "signal_time": alert["alert_time"],
+                    "signal_at": now.isoformat(),
+                    "code": alert["code"],
+                    "name": alert["name"],
+                    "strategy": "V2.9",
+                    "model": "TICK_V1",
+                    "entry": float(alert["entry"]),
+                    "stop": float(alert["stop"]),
+                    "scalp3": (
+                        float(baseline_scalp3)
+                        if baseline_scalp3 is not None
+                        else None
+                    ),
+                    "target_1r": float(item["baseline_target_1r"]),
+                    "target_2r": float(item["baseline_target_2r"]),
+                    "smart_ideal": float(item["ideal_entry"]),
+                    "smart_target_1r": float(item["target_1r"]),
+                    "smart_target_2r": float(item["target_2r"]),
+                    "smart_expires_at": smart_expires_at.isoformat(),
+                    "tracking_until": tracking_until.isoformat(),
+                    "status": "tracking",
+                    "tick_count": 0,
+                    "payload": {
+                        "setup": alert.get("setup"),
+                        "grade": alert.get("grade"),
+                        "score": alert.get("score"),
+                        "reentry": bool(alert.get("reentry")),
+                        "baseline_assumption": "signal reference price",
+                        "smart_touch_rule": "sell limit touched, not guaranteed fill",
+                    },
+                })
 
         cutoff = now.date() - timedelta(days=2)
         stale = []
@@ -641,6 +702,9 @@ def runtime_status_text():
         f"處置股排除：{v2._disposal_stats.get('active', 0)} 支\n"
         f"2日籌碼分類：{v2._chip2_stats.get('classified', {})}\n"
         f"Smart Entry：SMART_V1｜記錄 {len(_smart_rows())} 筆\n"
+        f"Tick Recorder：{('已連線' if _tick_recorder.status().get('authenticated') else '待連線')}｜"
+        f"追蹤 {_tick_recorder.status().get('active_audits', 0)} 筆｜"
+        f"訂閱 {len(_tick_recorder.status().get('subscriptions', []))} 檔\n"
         "指令：/brokers 全分點；/broker 6226 單股；/chips2 二日；/chip2 6226；/disposals 處置\n"
         "時段：09:00~10:00主策略；10:00~11:30弱勢反彈/二次進場\n"
         "模式：只提醒，不自動下單"
@@ -727,6 +791,7 @@ def _push_dashboard_snapshot(force=False):
                 "smart_entries": len(smart_entries),
                 "payload": {
                     "candidate_scan_date": dashboard_candidate_scan_date(now).isoformat(),
+                    "tick_recorder": _tick_recorder.status(),
                     "primary_end": "10:00",
                     "secondary_end": "11:30",
                 },
@@ -829,6 +894,7 @@ def dashboard_live():
             "alerted_today": len(legacy._alerted_today),
             "smart_entries": len(_smart_rows()),
             "smart_model": "SMART_V1",
+            "tick_recorder": _tick_recorder.status(),
             "primary_end": "10:00",
             "secondary_end": "11:30",
         },
@@ -867,11 +933,14 @@ def runtime_status():
         "max_alerts_per_symbol": v2.MAX_ALERTS_PER_SYMBOL,
         "smart_entries": len(_smart_rows()),
         "smart_model": "SMART_V1",
+        "tick_recorder": _tick_recorder.status(),
         "primary_end": "10:00",
         "secondary_end": "11:30",
         "time": datetime.now(TW_TZ).isoformat(),
     }
 
+
+_tick_recorder.start()
 
 threading.Thread(
     target=precise_intraday_loop,
