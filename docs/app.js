@@ -30,6 +30,7 @@ const titles = {
 let snapshot = emptySnapshot();
 let alerts = [];
 let smartEntries = [];
+let tickAudits = [];
 let runtime = null;
 let liveError = '';
 let session = loadSession();
@@ -277,6 +278,7 @@ async function refreshData() {
     snapshot = result.snapshot;
     alerts = result.alerts;
     smartEntries = result.smartEntries || [];
+    tickAudits = result.tickAudits || [];
     runtime = result.runtime ? { ...result.runtime, candidate_scan_date: result.live?.candidate_scan_date } : null;
     liveError = result.liveError;
     $('#user-email').textContent = session?.user?.email || config.ownerEmail || '';
@@ -370,6 +372,7 @@ $('#logout').addEventListener('click', async () => {
   snapshot = emptySnapshot();
   alerts = [];
   smartEntries = [];
+  tickAudits = [];
   runtime = null;
   showLogin('');
 });
